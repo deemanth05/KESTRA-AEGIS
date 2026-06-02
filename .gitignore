@@ -1,0 +1,33 @@
+# Kestra Hackathon Gitignore
+
+# Secret/Environment files
+.env
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Databases (DuckDB files)
+data/*.db
+data/*.wal
+data/*.tmp
+
+# IDE config files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS Files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Planning files and specification docs (Internal development references)
+MASTER_PLAN.md
+PROGRESS.md
+docs/
