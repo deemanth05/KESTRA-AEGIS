@@ -7,7 +7,8 @@ tasks:
     containerImage: python:3.11-slim
     beforeCommands:
       - pip install duckdb
-    docker:
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
       volumes:
         - /tmp/kestra-wd:/app/data
     script: |

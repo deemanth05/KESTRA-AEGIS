@@ -16,7 +16,8 @@ tasks:
     containerImage: python:3.11-slim
     beforeCommands:
       - pip install duckdb
-    docker:
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
       volumes:
         - /tmp/kestra-wd:/app/data
     script: |
@@ -82,8 +83,8 @@ tasks:
                   "stack_trace": "ValueError: Columns in source data do not match target database schema."
               }
               
-          from kestra import Kestra
-          Kestra.outputs({"payload": payload})
+          import json
+          print(f"::{json.dumps({'outputs': {'payload': payload}})}::", flush=True)
 
       finally:
           con.close()

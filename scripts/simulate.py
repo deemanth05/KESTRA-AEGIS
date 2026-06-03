@@ -72,11 +72,12 @@ def main():
             }
             
         # Write Kestra outputs
-        try:
-            from kestra import Kestra
-            Kestra.outputs({"payload": payload})
+        outputs_file = os.getenv("KESTRA_OUTPUTS_FILE")
+        if outputs_file:
+            with open(outputs_file, "w") as f:
+                json.dump({"payload": payload}, f)
             print("Successfully wrote Kestra outputs.")
-        except ImportError:
+        else:
             # If running locally without Kestra package, just output JSON to stdout
             print(json.dumps(payload, indent=2))
 

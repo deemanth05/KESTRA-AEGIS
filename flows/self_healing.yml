@@ -1,0 +1,173 @@
+id: self_healing
+namespace: aegis
+
+inputs:
+  - id: pipeline_name
+    type: STRING
+  - id: error_message
+    type: STRING
+  - id: error_type
+    type: STRING
+    defaults: UNKNOWN
+  - id: affected_table
+    type: STRING
+    defaults: unknown
+  - id: stack_trace
+    type: STRING
+    defaults: ""
+  - id: sample_data
+    type: STRING
+    defaults: ""
+  - id: schema_info
+    type: STRING
+    defaults: ""
+
+tasks:
+  # ── Step 1: Classify Error Risk ──────────────────
+  - id: classify_error
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    env:
+      ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
+      ERROR_MESSAGE: "{{ trigger.body.error_message ?? inputs.error_message }}"
+    script: |
+      import argparse
+      import json
+      import os
+
+      error_type = os.getenv("ERROR_TYPE", "UNKNOWN").upper()
+      error_msg = os.getenv("ERROR_MESSAGE", "")
+
+      # Rule-based risk assessment mapping
+      HIGH_RISK_TYPES = ["SCHEMA_DRIFT", "DATA_LOSS", "PERMISSION_ERROR"]
+      LOW_RISK_TYPES = ["TYPE_MISMATCH", "NULL_VIOLATION", "API_TIMEOUT", "STALE_DATA"]
+
+      if error_type in HIGH_RISK_TYPES:
+          risk_level = "HIGH"
+      elif error_type in LOW_RISK_TYPES:
+          risk_level = "LOW"
+      else:
+          risk_level = "HIGH"
+
+      outputs = {
+          "risk_level": risk_level,
+          "error_type": error_type,
+          "error_message": error_msg
+      }
+
+      print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+
+  # ── Step 2: Diagnose (Mock for Phase 2) ──────────
+  - id: diagnose
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    env:
+      ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
+    script: |
+      import os
+      import json
+
+      error_type = os.getenv("ERROR_TYPE", "UNKNOWN")
+
+      if error_type == "TYPE_MISMATCH":
+          result = {
+              "root_cause": "Column 'amount' contains varchar value 'not_a_number' which violates DECIMAL type constraint.",
+              "fix_type": "SQL",
+              "fix_code": "UPDATE orders SET amount = NULL WHERE order_id = 16;",
+              "explanation": "Set the invalid varchar value to NULL to match the DECIMAL type.",
+              "confidence": 0.95,
+              "risk_assessment": "LOW"
+          }
+      elif error_type == "NULL_VIOLATION":
+          result = {
+              "root_cause": "Column 'amount' contains unexpected NULL values.",
+              "fix_type": "SQL",
+              "fix_code": "UPDATE orders SET amount = 0.00 WHERE amount IS NULL;",
+              "explanation": "Set NULL values in 'amount' column to a default of 0.00.",
+              "confidence": 0.90,
+              "risk_assessment": "LOW"
+          }
+      else:
+          result = {
+              "root_cause": "Source CSV has column 'discount_code' which is missing from target orders table.",
+              "fix_type": "SQL",
+              "fix_code": "ALTER TABLE orders ADD COLUMN discount_code VARCHAR;",
+              "explanation": "Add the missing 'discount_code' column as VARCHAR to support schema drift.",
+              "confidence": 0.98,
+              "risk_assessment": "HIGH"
+          }
+
+      print(f"::{json.dumps({'outputs': result})}::", flush=True)
+
+  # ── Step 3: Risk Gate routing ─────────────────────
+  - id: risk_gate
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ outputs.classify_error.vars.risk_level }}"
+    cases:
+      LOW:
+        - id: auto_remediate
+          type: io.kestra.plugin.core.log.Log
+          message: |
+            ⚡ AUTO-REMEDIATION STARTING
+            Executing mock fix ({{ outputs.diagnose.vars.fix_type }}):
+            {{ outputs.diagnose.vars.fix_code }}
+      HIGH:
+        - id: human_approval
+          type: io.kestra.plugin.core.flow.Pause
+          description: |
+            Gemini Diagnosis: {{ outputs.diagnose.vars.explanation }}
+            Proposed Fix ({{ outputs.diagnose.vars.fix_type }}):
+            {{ outputs.diagnose.vars.fix_code }}
+          onResume:
+            - id: approved
+              type: BOOLEAN
+              description: "Approve this fix?"
+            - id: reviewer_notes
+              type: STRING
+              description: "Optional reviewer notes"
+              defaults: ""
+
+        - id: check_approval
+          type: io.kestra.plugin.core.flow.If
+          condition: "{{ outputs.human_approval.onResume.approved }}"
+          then:
+            - id: approved_remediate
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                ✅ MANUAL APPROVAL RECEIVED
+                Executing approved fix: {{ outputs.diagnose.vars.fix_code }}
+          else:
+            - id: escalate
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                🚨 ESCALATION: Fix rejected by reviewer.
+                Pipeline: {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
+                Reviewer notes: {{ outputs.human_approval.onResume.reviewer_notes }}
+
+  # ── Step 4: Incident Documentation ────────────────
+  - id: post_mortem
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ═══════════════════════════════════════════
+      📋 INCIDENT POST-MORTEM (SKELETON)
+      ═══════════════════════════════════════════
+      Pipeline:     {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
+      Error Type:   {{ trigger.body.error_type ?? inputs.error_type }}
+      Table:        {{ trigger.body.affected_table ?? inputs.affected_table }}
+      Root Cause:   {{ outputs.diagnose.vars.root_cause }}
+      Fix Proposed: {{ outputs.diagnose.vars.fix_type }}
+      Confidence:   {{ outputs.diagnose.vars.confidence }}
+      Explanation:  {{ outputs.diagnose.vars.explanation }}
+      ═══════════════════════════════════════════
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: aegis-webhook-secret
+
+errors:
+  - id: global_error_handler
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ⚠️ Aegis self-healing flow itself failed!
+      Error: {{ errorLogs() }}
