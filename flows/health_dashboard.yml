@@ -1,0 +1,210 @@
+id: health_dashboard
+namespace: aegis
+description: |
+  Aegis Health Dashboard — Aggregates system metrics, incident history, 
+  memory stats, and generates a formatted status report.
+  
+  Shows: MTTR, fix success rate, top error types, memory efficiency,
+  and recent incident timeline.
+
+labels:
+  flow_type: "reporting"
+
+tasks:
+  - id: generate_report
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install duckdb==1.3.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - /tmp/kestra-wd:/app/data
+    script: |
+      import os, sys, json, duckdb
+      from datetime import datetime
+
+      def main():
+          db_path = "/app/data/pipeline.duckdb"
+          if not os.path.exists(db_path):
+              print("Database not found. Run setup_database first.", file=sys.stderr)
+              sys.exit(1)
+
+          con = duckdb.connect(db_path, read_only=True)
+          report = []
+
+          report.append("")
+          report.append("══════════════════════════════════════════════════════════")
+          report.append("  🛡️  KESTRA AEGIS — HEALTH DASHBOARD")
+          report.append(f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+          report.append("══════════════════════════════════════════════════════════")
+
+          # ── Incident Statistics ─────────────────────────
+          report.append("")
+          report.append("📊 INCIDENT STATISTICS")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              total = con.execute("SELECT COUNT(*) FROM incident_log").fetchone()[0]
+              fixed = con.execute("SELECT COUNT(*) FROM incident_log WHERE status = 'FIXED'").fetchone()[0]
+              failed = con.execute("SELECT COUNT(*) FROM incident_log WHERE status = 'FAILED'").fetchone()[0]
+              pending = con.execute("SELECT COUNT(*) FROM incident_log WHERE status = 'PENDING'").fetchone()[0]
+              success_rate = f"{(fixed / max(total, 1)) * 100:.1f}%"
+
+              report.append(f"  Total Incidents:     {total}")
+              report.append(f"  ✅ Fixed:            {fixed}")
+              report.append(f"  ❌ Failed:           {failed}")
+              report.append(f"  ⏳ Pending:          {pending}")
+              report.append(f"  📈 Success Rate:     {success_rate}")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not query incidents: {e}")
+              total = 0
+              success_rate = "N/A"
+
+          # ── MTTR (Mean Time To Resolution) ──────────────
+          report.append("")
+          report.append("⏱️  MEAN TIME TO RESOLUTION (MTTR)")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              mttr_result = con.execute("""
+                  SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at))) as avg_seconds,
+                         MIN(EXTRACT(EPOCH FROM (resolved_at - created_at))) as min_seconds,
+                         MAX(EXTRACT(EPOCH FROM (resolved_at - created_at))) as max_seconds
+                  FROM incident_log
+                  WHERE status = 'FIXED' AND resolved_at IS NOT NULL
+              """).fetchone()
+
+              if mttr_result and mttr_result[0] is not None:
+                  avg_s, min_s, max_s = mttr_result
+                  report.append(f"  Average MTTR:   {avg_s:.1f} seconds")
+                  report.append(f"  Fastest Fix:    {min_s:.1f} seconds")
+                  report.append(f"  Slowest Fix:    {max_s:.1f} seconds")
+                  report.append(f"  vs Industry:    ~13 hours (manual) → {avg_s:.0f}s (Aegis)")
+              else:
+                  report.append("  No resolved incidents yet.")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not calculate MTTR: {e}")
+
+          # ── Fix Memory Stats ────────────────────────────
+          report.append("")
+          report.append("🧠 FIX MEMORY SYSTEM")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              memory_total = con.execute("SELECT COUNT(*) FROM fix_history WHERE success = TRUE").fetchone()[0]
+              memory_hits = con.execute("SELECT COUNT(*) FROM incident_log WHERE fix_source = 'MEMORY'").fetchone()[0]
+              ai_calls = con.execute("SELECT COUNT(*) FROM incident_log WHERE fix_source = 'AI'").fetchone()[0]
+              total_applied = con.execute("SELECT COALESCE(SUM(applied_count), 0) FROM fix_history").fetchone()[0]
+              cache_rate = f"{(memory_hits / max(memory_hits + ai_calls, 1)) * 100:.1f}%"
+
+              report.append(f"  Fixes in Memory:    {memory_total}")
+              report.append(f"  Total Applications: {total_applied}")
+              report.append(f"  Cache Hit Rate:     {cache_rate}")
+              report.append(f"  AI Calls Saved:     {memory_hits} (reused from memory)")
+              report.append(f"  AI Calls Made:      {ai_calls}")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not query fix memory: {e}")
+              cache_rate = "N/A"
+
+          # ── Top Error Types ─────────────────────────────
+          report.append("")
+          report.append("🏷️  TOP ERROR TYPES")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              top_errors = con.execute("""
+                  SELECT error_type, COUNT(*) as count,
+                         SUM(CASE WHEN status = 'FIXED' THEN 1 ELSE 0 END) as fixed_count
+                  FROM incident_log
+                  GROUP BY error_type
+                  ORDER BY count DESC
+                  LIMIT 5
+              """).fetchall()
+
+              if top_errors:
+                  for err_type, count, fixed_count in top_errors:
+                      bar = "█" * min(count, 20)
+                      fix_rate = f"{(fixed_count / max(count, 1)) * 100:.0f}%"
+                      report.append(f"  {err_type:20s} {bar} {count} incidents ({fix_rate} fixed)")
+              else:
+                  report.append("  No incidents recorded yet.")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not query error types: {e}")
+
+          # ── Recent Incidents Timeline ───────────────────
+          report.append("")
+          report.append("📋 RECENT INCIDENTS (Last 10)")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              recent = con.execute("""
+                  SELECT id, pipeline_name, error_type, affected_table, status, fix_source,
+                         created_at, resolved_at
+                  FROM incident_log
+                  ORDER BY created_at DESC
+                  LIMIT 10
+              """).fetchall()
+
+              if recent:
+                  for inc in recent:
+                      inc_id, pipe, err, tbl, status, source, created, resolved = inc
+                      status_icon = {"FIXED": "✅", "FAILED": "❌", "PENDING": "⏳"}.get(status, "❓")
+                      source_tag = f"[{source}]" if source else ""
+                      report.append(f"  {status_icon} #{inc_id} {pipe}.{tbl} — {err} {source_tag} ({status})")
+              else:
+                  report.append("  No incidents recorded yet.")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not query recent incidents: {e}")
+
+          # ── Data Quality Status ─────────────────────────
+          report.append("")
+          report.append("📦 DATA TABLES STATUS")
+          report.append("─────────────────────────────────────────────")
+
+          try:
+              tables = con.execute("""
+                  SELECT table_name FROM information_schema.tables
+                  WHERE table_schema = 'main'
+                  AND table_name NOT IN ('fix_history', 'incident_log', 'data_quality_baselines')
+              """).fetchall()
+
+              for (tbl_name,) in tables:
+                  row_count = con.execute(f"SELECT COUNT(*) FROM {tbl_name}").fetchone()[0]
+                  report.append(f"  📊 {tbl_name}: {row_count} rows")
+          except Exception as e:
+              report.append(f"  ⚠️ Could not query tables: {e}")
+
+          report.append("")
+          report.append("══════════════════════════════════════════════════════════")
+          report.append("  🛡️  Kestra Aegis — Self-Healing Data Pipelines")
+          report.append("══════════════════════════════════════════════════════════")
+
+          # Print full report
+          full_report = "\n".join(report)
+          print(full_report)
+
+          # Output structured metrics
+          outputs = {
+              "total_incidents": str(total),
+              "success_rate": success_rate,
+              "cache_hit_rate": cache_rate if 'cache_rate' in dir() else "N/A",
+              "report": full_report[:2000]
+          }
+          print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+
+          con.close()
+
+      if __name__ == "__main__":
+          main()
+
+outputs:
+  - id: total_incidents
+    type: STRING
+    value: "{{ outputs.generate_report.vars.total_incidents }}"
+  - id: success_rate
+    type: STRING
+    value: "{{ outputs.generate_report.vars.success_rate }}"
+  - id: cache_hit_rate
+    type: STRING
+    value: "{{ outputs.generate_report.vars.cache_hit_rate }}"

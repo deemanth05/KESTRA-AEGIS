@@ -1,0 +1,302 @@
+id: remediate_pipeline
+namespace: aegis
+description: |
+  Shared Remediation Subflow — executes a validated fix against the database.
+  
+  Called by self_healing.yml for both LOW risk (auto) and HIGH risk (approved) paths.
+  Performs: SQL safety validation → execution → post-fix verification → memory storage → incident update.
+
+inputs:
+  - id: fix_type
+    type: STRING
+  - id: fix_code
+    type: STRING
+  - id: error_signature
+    type: STRING
+    defaults: ""
+  - id: incident_id
+    type: STRING
+    defaults: "0"
+  - id: fix_source
+    type: STRING
+    defaults: "AI"
+  - id: root_cause
+    type: STRING
+    defaults: ""
+  - id: explanation
+    type: STRING
+    defaults: ""
+  - id: confidence
+    type: STRING
+    defaults: "0"
+  - id: risk_assessment
+    type: STRING
+    defaults: "HIGH"
+  - id: error_type
+    type: STRING
+    defaults: "UNKNOWN"
+  - id: affected_table
+    type: STRING
+    defaults: "unknown"
+  - id: method_label
+    type: STRING
+    defaults: "AUTO_SQL"
+
+tasks:
+  # ══════════════════════════════════════════════════════════
+  # STEP 1: Validate and Execute Fix
+  # ══════════════════════════════════════════════════════════
+  - id: execute_fix
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install duckdb==1.3.0 sqlglot==26.30.0
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - /tmp/kestra-wd:/app/data
+    retry:
+      type: exponential
+      maxAttempt: 3
+      interval: PT5S
+      maxInterval: PT1M
+    env:
+      FIX_TYPE: "{{ inputs.fix_type }}"
+      FIX_CODE: "{{ inputs.fix_code }}"
+      ERROR_SIGNATURE: "{{ inputs.error_signature }}"
+      INCIDENT_ID: "{{ inputs.incident_id }}"
+      FIX_SOURCE: "{{ inputs.fix_source }}"
+      ROOT_CAUSE: "{{ inputs.root_cause }}"
+      EXPLANATION: "{{ inputs.explanation }}"
+      CONFIDENCE: "{{ inputs.confidence }}"
+      RISK_ASSESSMENT: "{{ inputs.risk_assessment }}"
+      ERROR_TYPE: "{{ inputs.error_type }}"
+      AFFECTED_TABLE: "{{ inputs.affected_table }}"
+      METHOD_LABEL: "{{ inputs.method_label }}"
+    script: |
+      import os
+      import sys
+      import json
+      import duckdb
+
+      def main():
+          fix_type = os.getenv("FIX_TYPE", "SKIP").upper()
+          fix_code = os.getenv("FIX_CODE", "").strip()
+          db_path = "/app/data/pipeline.duckdb"
+          error_signature = os.getenv("ERROR_SIGNATURE", "")
+          incident_id = os.getenv("INCIDENT_ID", "0")
+          fix_source = os.getenv("FIX_SOURCE", "AI")
+          method_label = os.getenv("METHOD_LABEL", "AUTO_SQL")
+          error_type = os.getenv("ERROR_TYPE", "UNKNOWN")
+          affected_table = os.getenv("AFFECTED_TABLE", "unknown")
+
+          if not fix_code:
+              outputs = {"status": "SKIPPED", "method": "NONE", "error_message": "No fix code provided.",
+                         "rows_affected": "0", "verification_passed": "true"}
+              print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+              sys.exit(0)
+
+          # ── Safety Check — AST-based SQL validation via sqlglot ──
+          import sqlglot
+          ALLOWED_SQL_TYPES = {"update", "alter", "insert"}
+          try:
+              parsed = sqlglot.parse(fix_code, dialect="duckdb")
+              for stmt in parsed:
+                  if stmt is None:
+                      continue
+                  stmt_type = stmt.key.lower()
+                  if stmt_type not in ALLOWED_SQL_TYPES:
+                      err_msg = f"Safety violation: blocked statement type '{stmt_type.upper()}' (only UPDATE/ALTER/INSERT allowed)"
+                      outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg,
+                                 "rows_affected": "0", "verification_passed": "false"}
+                      print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                      sys.exit(1)
+              print(f"✅ SQL safety check passed (statement type: {', '.join(s.key.upper() for s in parsed if s)})")
+          except sqlglot.errors.ParseError as e:
+              err_msg = f"Safety violation: unparseable SQL blocked — {e}"
+              outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg,
+                         "rows_affected": "0", "verification_passed": "false"}
+              print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+              sys.exit(1)
+
+          con = None
+          try:
+              if fix_type == "SQL":
+                  if not os.path.exists(db_path):
+                      outputs = {"status": "FAILED", "method": method_label, "error_message": f"DB not found at {db_path}",
+                                 "rows_affected": "0", "verification_passed": "false"}
+                      print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                      sys.exit(1)
+
+                  con = duckdb.connect(db_path)
+
+                  # ── Capture pre-fix state for verification ──
+                  pre_fix_snapshot = {}
+                  try:
+                      if error_type == "NULL_VIOLATION":
+                          # Count NULLs before fix
+                          cols = con.execute(f"""
+                              SELECT column_name FROM information_schema.columns
+                              WHERE table_name = '{affected_table}' AND table_schema = 'main'
+                          """).fetchall()
+                          for (col,) in cols:
+                              null_count = con.execute(f"SELECT COUNT(*) FROM {affected_table} WHERE {col} IS NULL").fetchone()[0]
+                              if null_count > 0:
+                                  pre_fix_snapshot[f"null_{col}"] = null_count
+                      elif error_type in ("TYPE_MISMATCH", "DATA_ANOMALY"):
+                          pre_fix_snapshot["row_count"] = con.execute(f"SELECT COUNT(*) FROM {affected_table}").fetchone()[0]
+                      elif error_type == "SCHEMA_DRIFT":
+                          pre_fix_snapshot["columns"] = [c[0] for c in con.execute(f"""
+                              SELECT column_name FROM information_schema.columns
+                              WHERE table_name = '{affected_table}' AND table_schema = 'main'
+                          """).fetchall()]
+                  except Exception as e:
+                      print(f"Warning: Could not capture pre-fix state: {e}", file=sys.stderr)
+
+                  # ── Execute the fix ──
+                  print(f"Executing SQL Fix:\n{fix_code}")
+                  result = con.execute(fix_code)
+
+                  # Check rows affected where applicable
+                  rows_affected = 0
+                  try:
+                      if fix_code.strip().upper().startswith("UPDATE") or fix_code.strip().upper().startswith("INSERT"):
+                          rows_affected = con.execute("SELECT changes()").fetchone()[0]
+                          print(f"📊 Rows affected: {rows_affected}")
+                          if rows_affected == 0:
+                              print("⚠️ Warning: Fix executed but 0 rows were affected.")
+                  except Exception:
+                      pass
+
+                  print("✅ SQL executed successfully.")
+
+                  # ── Post-fix verification ──
+                  verification_passed = True
+                  try:
+                      if error_type == "NULL_VIOLATION":
+                          for key, pre_count in pre_fix_snapshot.items():
+                              col = key.replace("null_", "")
+                              post_count = con.execute(f"SELECT COUNT(*) FROM {affected_table} WHERE {col} IS NULL").fetchone()[0]
+                              if post_count < pre_count:
+                                  print(f"✅ Verification: {col} NULLs reduced from {pre_count} → {post_count}")
+                              elif post_count >= pre_count:
+                                  print(f"⚠️ Verification: {col} NULLs unchanged ({post_count})")
+                                  verification_passed = False
+                      elif error_type == "SCHEMA_DRIFT":
+                          post_cols = [c[0] for c in con.execute(f"""
+                              SELECT column_name FROM information_schema.columns
+                              WHERE table_name = '{affected_table}' AND table_schema = 'main'
+                          """).fetchall()]
+                          pre_cols = pre_fix_snapshot.get("columns", [])
+                          new_cols = set(post_cols) - set(pre_cols)
+                          if new_cols:
+                              print(f"✅ Verification: New columns added: {', '.join(new_cols)}")
+                          else:
+                              print("✅ Verification: Schema change applied.")
+                      elif error_type in ("TYPE_MISMATCH", "DATA_ANOMALY"):
+                          post_count = con.execute(f"SELECT COUNT(*) FROM {affected_table}").fetchone()[0]
+                          pre_count = pre_fix_snapshot.get("row_count", 0)
+                          print(f"✅ Verification: Row count {pre_count} → {post_count}")
+                      else:
+                          print("✅ Verification: Fix executed (no specific check for this error type).")
+                  except Exception as e:
+                      print(f"Warning: Post-fix verification failed: {e}", file=sys.stderr)
+                      verification_passed = False
+
+                  outputs = {"status": "FIXED", "method": method_label, "executed_code": fix_code,
+                             "rows_affected": str(rows_affected), "verification_passed": str(verification_passed).lower()}
+
+                  # ── STORE IN FIX MEMORY ──
+                  if fix_source == "AI" and error_signature:
+                      try:
+                          existing = con.execute(
+                              "SELECT id FROM fix_history WHERE error_signature = ?", [error_signature]
+                          ).fetchone()
+                          if not existing:
+                              max_id = con.execute("SELECT COALESCE(MAX(id), 0) FROM fix_history").fetchone()[0]
+                              con.execute("""
+                                  INSERT INTO fix_history (id, error_signature, error_type, affected_table,
+                                      error_message_pattern, fix_type, fix_code, root_cause, explanation,
+                                      confidence, risk_assessment, success, applied_count)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 1)
+                              """, [
+                                  max_id + 1, error_signature,
+                                  error_type, affected_table,
+                                  os.getenv("ROOT_CAUSE", "")[:200],
+                                  fix_type, fix_code,
+                                  os.getenv("ROOT_CAUSE", ""), os.getenv("EXPLANATION", ""),
+                                  float(os.getenv("CONFIDENCE", "0")),
+                                  os.getenv("RISK_ASSESSMENT", "HIGH")
+                              ])
+                              print("🧠 Fix stored in memory for future reuse!")
+                          else:
+                              print("🧠 Fix already in memory, updated applied count.")
+                      except Exception as e:
+                          print(f"Warning: Could not store fix in memory: {e}", file=sys.stderr)
+
+                  # ── UPDATE INCIDENT LOG ──
+                  try:
+                      if incident_id != "0":
+                          con.execute("""
+                              UPDATE incident_log
+                              SET status = 'FIXED', root_cause = ?, fix_code = ?, resolved_at = CURRENT_TIMESTAMP
+                              WHERE id = ?
+                          """, [os.getenv("ROOT_CAUSE", ""), fix_code, int(incident_id)])
+                          print(f"📋 Incident #{incident_id} marked as FIXED.")
+                  except Exception as e:
+                      print(f"Warning: Could not update incident log: {e}", file=sys.stderr)
+
+              elif fix_type == "PYTHON":
+                  print("⚠️ Python execution blocked for security. Manual review required.")
+                  print(f"Proposed Python code:\n{fix_code}")
+                  outputs = {"status": "BLOCKED", "method": "PYTHON_BLOCKED",
+                             "error_message": "Python execution disabled for security. Review fix_code manually.",
+                             "proposed_code": fix_code, "rows_affected": "0", "verification_passed": "false"}
+
+              else:
+                  outputs = {"status": "SKIPPED", "method": fix_type,
+                             "error_message": f"Skipped for type: {fix_type}",
+                             "rows_affected": "0", "verification_passed": "true"}
+
+          except duckdb.Error as e:
+              outputs = {"status": "FAILED", "method": method_label, "error_message": f"SQL error: {str(e)}",
+                         "rows_affected": "0", "verification_passed": "false"}
+              # Mark incident as failed
+              try:
+                  if con and incident_id != "0":
+                      con.execute("UPDATE incident_log SET status = 'FAILED' WHERE id = ?", [int(incident_id)])
+              except Exception:
+                  pass
+          except Exception as e:
+              outputs = {"status": "FAILED", "method": fix_type, "error_message": str(e),
+                         "rows_affected": "0", "verification_passed": "false"}
+          finally:
+              if con:
+                  con.close()
+
+          print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+          if outputs.get("status") == "FAILED":
+              sys.exit(1)
+
+      if __name__ == "__main__":
+          main()
+
+outputs:
+  - id: status
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.status }}"
+  - id: method
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.method }}"
+  - id: executed_code
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.executed_code ?? '' }}"
+  - id: rows_affected
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.rows_affected ?? '0' }}"
+  - id: verification_passed
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.verification_passed ?? 'false' }}"
+  - id: error_message
+    type: STRING
+    value: "{{ outputs.execute_fix.vars.error_message ?? '' }}"

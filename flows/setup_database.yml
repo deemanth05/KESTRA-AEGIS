@@ -3,14 +3,18 @@ namespace: aegis
 description: |
   Initializes the DuckDB database with clean demo data and Aegis system tables.
   Run this FIRST before any other Aegis flow.
-  Tables created: orders (demo data), fix_history (learning memory), incident_log (correlation), data_quality_baselines (anomaly detection).
+  Tables created: orders, customers (demo data), fix_history (learning memory), 
+  incident_log (correlation), data_quality_baselines (anomaly detection).
+
+labels:
+  flow_type: "setup"
 
 tasks:
   - id: init_duckdb
     type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.11-slim
     beforeCommands:
-      - pip install duckdb
+      - pip install duckdb==1.3.0
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
       volumes:
@@ -61,9 +65,37 @@ tasks:
       print(f"✅ Loaded {order_count} rows into 'orders' table.")
 
       # ═══════════════════════════════════════════════════
-      # TABLE 2: fix_history (Learning Memory System)
-      # Stores every successful fix. Before calling Gemini,
-      # the system checks here first for a proven fix.
+      # TABLE 2: customers (Multi-Pipeline Demo Data)
+      # ═══════════════════════════════════════════════════
+      con.execute("DROP TABLE IF EXISTS customers")
+      con.execute("""
+        CREATE TABLE customers (
+          customer_id INTEGER PRIMARY KEY,
+          name VARCHAR,
+          email VARCHAR,
+          signup_date DATE,
+          lifetime_value DECIMAL(10,2)
+        )
+      """)
+
+      customers_data = [
+          (1, 'Alice Smith', 'alice@example.com', '2025-01-15', 1250.50),
+          (2, 'Bob Johnson', 'bob@example.com', '2025-02-20', 890.00),
+          (3, 'Charlie Brown', 'charlie@example.com', '2025-03-10', 2100.75),
+          (4, 'Diana Prince', 'diana@example.com', '2025-04-05', 450.99),
+          (5, 'Evan Wright', 'evan@example.com', '2025-05-12', 3200.00),
+          (6, 'Fiona Gallagher', 'fiona@example.com', '2025-06-18', 175.25),
+          (7, 'George Costanza', 'george@example.com', '2025-07-22', 920.40),
+          (8, 'Hannah Abbott', 'hannah@example.com', '2025-08-30', 1580.00),
+          (9, 'Ian Malcolm', 'ian@example.com', '2025-09-14', 680.90),
+          (10, 'Julia Roberts', 'julia@example.com', '2025-10-01', 4500.00),
+      ]
+      con.executemany("INSERT INTO customers VALUES (?, ?, ?, ?, ?)", customers_data)
+      customer_count = con.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+      print(f"✅ Loaded {customer_count} rows into 'customers' table.")
+
+      # ═══════════════════════════════════════════════════
+      # TABLE 3: fix_history (Learning Memory System)
       # ═══════════════════════════════════════════════════
       con.execute("DROP TABLE IF EXISTS fix_history")
       con.execute("""
@@ -85,13 +117,12 @@ tasks:
           last_applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       """)
-      print("✅ Created 'fix_history' table (learning memory).")
+      # Create index on error_signature for fast memory lookups
+      con.execute("CREATE INDEX idx_fix_signature ON fix_history(error_signature)")
+      print("✅ Created 'fix_history' table with signature index (learning memory).")
 
       # ═══════════════════════════════════════════════════
-      # TABLE 3: incident_log (Incident Correlation)
-      # Logs every incident for time-window correlation.
-      # When multiple incidents cluster, Gemini analyzes
-      # them together to find the shared root cause.
+      # TABLE 4: incident_log (Incident Correlation)
       # ═══════════════════════════════════════════════════
       con.execute("DROP TABLE IF EXISTS incident_log")
       con.execute("""
@@ -114,9 +145,7 @@ tasks:
       print("✅ Created 'incident_log' table (correlation engine).")
 
       # ═══════════════════════════════════════════════════
-      # TABLE 4: data_quality_baselines (Anomaly Detection)
-      # Stores expected metrics for each table so the
-      # anomaly monitor can compare current vs expected.
+      # TABLE 5: data_quality_baselines (Anomaly Detection)
       # ═══════════════════════════════════════════════════
       con.execute("DROP TABLE IF EXISTS data_quality_baselines")
       con.execute("""
@@ -130,17 +159,26 @@ tasks:
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       """)
-      con.execute("DELETE FROM data_quality_baselines")
 
       baselines = [
+          # Orders table baselines
           (1, 'orders', 'row_count', 10, 10000, 'Expected row count range'),
           (2, 'orders', 'null_amount_pct', 0, 5.0, 'Max acceptable NULL percentage in amount column'),
           (3, 'orders', 'avg_amount', 10.0, 1000.0, 'Expected average order amount range'),
           (4, 'orders', 'min_amount', 0.0, 50.0, 'Expected minimum order amount'),
           (5, 'orders', 'max_amount', 50.0, 5000.0, 'Expected maximum order amount'),
+          # Customers table baselines
+          (6, 'customers', 'row_count', 5, 50000, 'Expected customer count range'),
+          (7, 'customers', 'null_email_pct', 0, 2.0, 'Max acceptable NULL percentage in email column'),
+          (8, 'customers', 'avg_lifetime_value', 100.0, 10000.0, 'Expected average lifetime value range'),
+          (9, 'customers', 'min_lifetime_value', 0.0, 500.0, 'Expected minimum lifetime value'),
+          (10, 'customers', 'max_lifetime_value', 500.0, 100000.0, 'Expected maximum lifetime value'),
       ]
-      con.executemany("INSERT INTO data_quality_baselines (id, table_name, metric_name, expected_min, expected_max, description) VALUES (?, ?, ?, ?, ?, ?)", baselines)
-      print("✅ Created 'data_quality_baselines' table with 5 baseline rules.")
+      con.executemany(
+          "INSERT INTO data_quality_baselines (id, table_name, metric_name, expected_min, expected_max, description) VALUES (?, ?, ?, ?, ?, ?)",
+          baselines
+      )
+      print("✅ Created 'data_quality_baselines' table with 10 baseline rules (orders + customers).")
 
       # ═══════════════════════════════════════════════════
       # Summary
@@ -152,7 +190,8 @@ tasks:
       summary = {
           "tables_created": len(table_names),
           "table_names": ", ".join(table_names),
-          "orders_loaded": order_count
+          "orders_loaded": order_count,
+          "customers_loaded": customer_count
       }
       print(f"::{json.dumps({'outputs': summary})}::", flush=True)
 

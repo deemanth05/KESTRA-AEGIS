@@ -20,7 +20,7 @@ def upload_flow(filepath):
         print(f"[ERROR] Could not parse namespace/id for {filepath}")
         return
         
-    auth = ("admin@kestra.io", "Admin1234!")
+    auth = (os.getenv("KESTRA_USER", "admin@kestra.io"), os.getenv("KESTRA_PASSWORD", "Admin1234!"))
     headers = {"Content-Type": "application/x-yaml"}
     
     with open(filepath, 'rb') as f:
