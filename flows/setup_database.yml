@@ -29,15 +29,15 @@ tasks:
       # ═══════════════════════════════════════════════════
       # TABLE 1: orders (Demo Pipeline Data)
       # ═══════════════════════════════════════════════════
+      con.execute("DROP TABLE IF EXISTS orders")
       con.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
+        CREATE TABLE orders (
           order_id INTEGER PRIMARY KEY,
           customer_name VARCHAR,
           amount DECIMAL(10,2),
           order_date DATE
         )
       """)
-      con.execute("DELETE FROM orders")
 
       orders_data = [
           (1, 'Alice Smith', 120.50, '2026-06-01'),
@@ -65,8 +65,9 @@ tasks:
       # Stores every successful fix. Before calling Gemini,
       # the system checks here first for a proven fix.
       # ═══════════════════════════════════════════════════
+      con.execute("DROP TABLE IF EXISTS fix_history")
       con.execute("""
-        CREATE TABLE IF NOT EXISTS fix_history (
+        CREATE TABLE fix_history (
           id INTEGER PRIMARY KEY,
           error_signature VARCHAR,
           error_type VARCHAR,
@@ -84,7 +85,6 @@ tasks:
           last_applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
       """)
-      con.execute("DELETE FROM fix_history")
       print("✅ Created 'fix_history' table (learning memory).")
 
       # ═══════════════════════════════════════════════════
@@ -93,8 +93,9 @@ tasks:
       # When multiple incidents cluster, Gemini analyzes
       # them together to find the shared root cause.
       # ═══════════════════════════════════════════════════
+      con.execute("DROP TABLE IF EXISTS incident_log")
       con.execute("""
-        CREATE TABLE IF NOT EXISTS incident_log (
+        CREATE TABLE incident_log (
           id INTEGER PRIMARY KEY,
           pipeline_name VARCHAR,
           error_type VARCHAR,
@@ -110,7 +111,6 @@ tasks:
           resolved_at TIMESTAMP
         )
       """)
-      con.execute("DELETE FROM incident_log")
       print("✅ Created 'incident_log' table (correlation engine).")
 
       # ═══════════════════════════════════════════════════
@@ -118,8 +118,9 @@ tasks:
       # Stores expected metrics for each table so the
       # anomaly monitor can compare current vs expected.
       # ═══════════════════════════════════════════════════
+      con.execute("DROP TABLE IF EXISTS data_quality_baselines")
       con.execute("""
-        CREATE TABLE IF NOT EXISTS data_quality_baselines (
+        CREATE TABLE data_quality_baselines (
           id INTEGER PRIMARY KEY,
           table_name VARCHAR,
           metric_name VARCHAR,

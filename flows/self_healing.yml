@@ -272,6 +272,7 @@ tasks:
           {correlation_section}
           Target database is DuckDB. Use DuckDB-compatible SQL syntax.
           NEVER generate DROP, DELETE, or TRUNCATE statements.
+          The generated fix_code MUST be a single, valid DuckDB SQL statement (typically UPDATE, ALTER TABLE, or INSERT) that modifies the target database in-place to resolve the issue. Do NOT generate SELECT statements, as SELECT statements do not modify the database. The table to modify is the Affected Table.
           If multiple related errors exist, identify the shared root cause.
           """
 
