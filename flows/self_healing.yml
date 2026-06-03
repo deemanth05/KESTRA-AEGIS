@@ -433,17 +433,38 @@ tasks:
   - id: post_mortem
     type: io.kestra.plugin.core.log.Log
     message: |
-      ═══════════════════════════════════════════
-      📋 INCIDENT POST-MORTEM (SKELETON)
-      ═══════════════════════════════════════════
-      Pipeline:     {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
-      Error Type:   {{ trigger.body.error_type ?? inputs.error_type }}
-      Table:        {{ trigger.body.affected_table ?? inputs.affected_table }}
-      Root Cause:   {{ outputs.diagnose.vars.root_cause }}
-      Fix Proposed: {{ outputs.diagnose.vars.fix_type }}
-      Confidence:   {{ outputs.diagnose.vars.confidence }}
-      Explanation:  {{ outputs.diagnose.vars.explanation }}
-      ═══════════════════════════════════════════
+      ════════════════════════════════════════════════════════════════
+      📋 KESTRA AEGIS — INCIDENT POST-MORTEM
+      ════════════════════════════════════════════════════════════════
+      🔴 PIPELINE FAILURE DETAILS:
+         • Pipeline:        {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
+         • Error Type:      {{ trigger.body.error_type ?? inputs.error_type }}
+         • Affected Table:  {{ trigger.body.affected_table ?? inputs.affected_table }}
+         • Schema Info:     {{ trigger.body.schema_info ?? inputs.schema_info }}
+
+      🤖 AI DIAGNOSIS:
+         • Root Cause:      {{ outputs.diagnose.vars.root_cause }}
+         • Confidence:      {{ outputs.diagnose.vars.confidence }}
+         • Explanation:     {{ outputs.diagnose.vars.explanation }}
+
+      🔧 REMEDIATION METRICS:
+         • Resolution Risk: {{ outputs.classify_error.vars.risk_level }}
+         • Execution Method:{{ outputs.auto_remediate.vars.method ?? outputs.approved_remediate.vars.method ?? 'SKIPPED' }}
+         • Final Status:    {{ outputs.auto_remediate.vars.status ?? outputs.approved_remediate.vars.status ?? 'SKIPPED' }}
+         • Executed Code:   {{ outputs.auto_remediate.vars.executed_code ?? outputs.approved_remediate.vars.executed_code ?? 'None' }}
+         • Error Details:   {{ outputs.auto_remediate.vars.error_message ?? outputs.approved_remediate.vars.error_message ?? 'None' }}
+      ════════════════════════════════════════════════════════════════
+
+  - id: slack_notification
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ globals['slack-webhook-url'] }}"
+    method: POST
+    contentType: application/json
+    body: |
+      {
+        "text": "🛡️ *Kestra Aegis — Self-Healing Incident Report*\n\n*Pipeline:* `{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}`\n*Error Type:* `{{ trigger.body.error_type ?? inputs.error_type }}`\n*Risk Level:* `{{ outputs.classify_error.vars.risk_level }}`\n*Status:* *{{ outputs.auto_remediate.vars.status ?? outputs.approved_remediate.vars.status ?? 'SKIPPED' }}*\n*Method:* `{{ outputs.auto_remediate.vars.method ?? outputs.approved_remediate.vars.method ?? 'NONE' }}`\n\n*AI Diagnosis:*\n> {{ outputs.diagnose.vars.root_cause }}\n\n*Executed Code:*\n```sql\n{{ outputs.auto_remediate.vars.executed_code ?? outputs.approved_remediate.vars.executed_code ?? 'None' }}\n```"
+      }
+    runIf: "{{ globals['slack-webhook-url'] is defined and globals['slack-webhook-url'] != '' }}"
 
 triggers:
   - id: webhook
