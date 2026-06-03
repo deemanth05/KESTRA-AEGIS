@@ -139,7 +139,7 @@ tasks:
           (4, 'orders', 'min_amount', 0.0, 50.0, 'Expected minimum order amount'),
           (5, 'orders', 'max_amount', 50.0, 5000.0, 'Expected maximum order amount'),
       ]
-      con.executemany("INSERT INTO data_quality_baselines VALUES (?, ?, ?, ?, ?, ?)", baselines)
+      con.executemany("INSERT INTO data_quality_baselines (id, table_name, metric_name, expected_min, expected_max, description) VALUES (?, ?, ?, ?, ?, ?)", baselines)
       print("✅ Created 'data_quality_baselines' table with 5 baseline rules.")
 
       # ═══════════════════════════════════════════════════
