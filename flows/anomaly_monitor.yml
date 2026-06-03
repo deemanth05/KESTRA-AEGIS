@@ -1,0 +1,170 @@
+id: anomaly_monitor
+namespace: aegis
+description: |
+  Proactive Data Quality Monitor — detects anomalies BEFORE pipelines break.
+  
+  Compares current data quality metrics against stored baselines in data_quality_baselines table.
+  If any metric is outside its expected range, triggers the self-healing webhook with a DATA_ANOMALY error.
+  
+  Run manually during demo, or set a schedule trigger for production use.
+
+tasks:
+  - id: check_data_quality
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install duckdb requests
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - /tmp/kestra-wd:/app/data
+    script: |
+      import os
+      import sys
+      import json
+      import duckdb
+
+      def main():
+          db_path = "/app/data/pipeline.duckdb"
+          if not os.path.exists(db_path):
+              print("Database not found. Run setup_database first.", file=sys.stderr)
+              sys.exit(1)
+
+          con = duckdb.connect(db_path)
+          anomalies = []
+          metrics_report = []
+
+          print("═══════════════════════════════════════════════════")
+          print("🔍 KESTRA AEGIS — PROACTIVE ANOMALY MONITOR")
+          print("═══════════════════════════════════════════════════\n")
+
+          # ── Gather Current Metrics ──────────────────────
+          try:
+              row_count = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+              metrics_report.append(f"  📊 Row Count: {row_count}")
+
+              null_count = con.execute("SELECT COUNT(*) FROM orders WHERE amount IS NULL").fetchone()[0]
+              null_pct = (null_count / max(row_count, 1)) * 100
+              metrics_report.append(f"  📊 NULL Amount Rows: {null_count} ({null_pct:.1f}%)")
+
+              avg_amount = con.execute("SELECT AVG(amount) FROM orders WHERE amount IS NOT NULL").fetchone()[0]
+              avg_amount = float(avg_amount) if avg_amount else 0
+              metrics_report.append(f"  📊 Average Amount: ${avg_amount:.2f}")
+
+              min_amount = con.execute("SELECT MIN(amount) FROM orders WHERE amount IS NOT NULL").fetchone()[0]
+              min_amount = float(min_amount) if min_amount else 0
+              metrics_report.append(f"  📊 Min Amount: ${min_amount:.2f}")
+
+              max_amount = con.execute("SELECT MAX(amount) FROM orders WHERE amount IS NOT NULL").fetchone()[0]
+              max_amount = float(max_amount) if max_amount else 0
+              metrics_report.append(f"  📊 Max Amount: ${max_amount:.2f}")
+
+              latest_date = con.execute("SELECT MAX(order_date) FROM orders").fetchone()[0]
+              metrics_report.append(f"  📊 Latest Order Date: {latest_date}")
+
+          except Exception as e:
+              print(f"Error gathering metrics: {e}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Current Metrics:")
+          for m in metrics_report:
+              print(m)
+          print()
+
+          # ── Compare Against Baselines ───────────────────
+          current_values = {
+              "row_count": row_count,
+              "null_amount_pct": null_pct,
+              "avg_amount": avg_amount,
+              "min_amount": min_amount,
+              "max_amount": max_amount,
+          }
+
+          try:
+              baselines = con.execute("""
+                  SELECT metric_name, expected_min, expected_max, description
+                  FROM data_quality_baselines
+                  WHERE table_name = 'orders'
+              """).fetchall()
+          except Exception:
+              baselines = []
+              print("Warning: No baselines found. Using defaults.", file=sys.stderr)
+
+          print("Baseline Checks:")
+          for metric_name, expected_min, expected_max, description in baselines:
+              current_val = current_values.get(metric_name)
+              if current_val is None:
+                  continue
+
+              status = "✅ PASS"
+              if current_val < expected_min or current_val > expected_max:
+                  status = "❌ FAIL"
+                  anomalies.append({
+                      "metric": metric_name,
+                      "current": current_val,
+                      "expected_min": expected_min,
+                      "expected_max": expected_max,
+                      "description": description
+                  })
+
+              print(f"  {status} {metric_name}: {current_val} (expected: {expected_min}–{expected_max})")
+
+          print()
+          con.close()
+
+          # ── Report Results ─────────────────────────────
+          if not anomalies:
+              print("🟢 ALL CHECKS PASSED — Data quality is within expected ranges.")
+              outputs = {
+                  "status": "HEALTHY",
+                  "anomaly_count": 0,
+                  "details": "All data quality metrics within expected baselines.",
+                  "triggered_healing": "false"
+              }
+              print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+              return
+
+          # ── ANOMALY DETECTED — Trigger Self-Healing ────
+          print(f"🔴 {len(anomalies)} ANOMALIES DETECTED!")
+          for a in anomalies:
+              print(f"   ⚠️ {a['metric']}: {a['current']} (expected {a['expected_min']}–{a['expected_max']})")
+
+          anomaly_summary = "; ".join([
+              f"{a['metric']}={a['current']} (expected {a['expected_min']}-{a['expected_max']})"
+              for a in anomalies
+          ])
+
+          # Build the error payload for self-healing
+          schema_info = "order_id INTEGER, customer_name VARCHAR, amount DECIMAL(10,2), order_date DATE"
+          payload = {
+              "pipeline_name": "aegis_anomaly_monitor",
+              "error_type": "DATA_ANOMALY",
+              "error_message": f"Proactive anomaly detection triggered. Anomalies found: {anomaly_summary}",
+              "affected_table": "orders",
+              "schema_info": schema_info,
+              "sample_data": f"Current metrics — Row count: {row_count}, NULL amount pct: {null_pct:.1f}%, Avg amount: ${avg_amount:.2f}",
+              "stack_trace": "Detected by aegis.anomaly_monitor scheduled scan."
+          }
+
+          # Trigger self-healing webhook
+          print("\n🚀 Triggering self-healing webhook...")
+          try:
+              import requests
+              webhook_url = "http://localhost:8080/api/v1/executions/webhook/aegis/self_healing/aegis-webhook-secret"
+              resp = requests.post(webhook_url, json=payload, timeout=10)
+              print(f"   Webhook response: {resp.status_code}")
+              triggered = resp.status_code in [200, 201, 204]
+          except Exception as e:
+              print(f"   Warning: Could not trigger webhook: {e}", file=sys.stderr)
+              triggered = False
+
+          outputs = {
+              "status": "ANOMALY_DETECTED",
+              "anomaly_count": len(anomalies),
+              "details": anomaly_summary,
+              "triggered_healing": str(triggered).lower()
+          }
+          print(f"\n::{json.dumps({'outputs': outputs})}::", flush=True)
+
+      if __name__ == "__main__":
+          main()

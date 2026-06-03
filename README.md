@@ -1,141 +1,181 @@
 # 🛡️ Kestra Aegis
 
-> *"Your data pipelines heal themselves."*
+> *"Your data pipelines heal themselves — and get smarter every time."*
 
-**Kestra Aegis** is an automated self-healing orchestrator that detects data pipeline failures, classifies risk, diagnoses the root cause using Gemini 2.5 Flash, and safely executes auto-remediations or manages human-in-the-loop approvals.
+**Kestra Aegis** is a self-healing data pipeline orchestrator with a **learning memory system**. It detects pipeline failures, diagnoses root causes using Gemini AI, executes safe remediations, correlates incidents across pipelines, and proactively monitors for anomalies — all orchestrated by Kestra.
 
-Built entirely using **Kestra**, **DuckDB**, and the **Gemini API (Structured Outputs)**, Aegis closes the gap between *detecting* pipeline failures (which tools like Monte Carlo or Bigeye do) and *resolving* them (which usually costs hours of data engineering time).
-
----
-
-## 🌟 The Problem & The Vision
-
-When production data pipelines break, they stay broken until a human engineer:
-1. Wakes up to a Slack alert.
-2. Manually queries the database to inspect the bad state.
-3. Formulates a fix (e.g. SQL migration or data update).
-4. Coordinates and executes the remediation.
-
-According to industry benchmarks, this manual loop takes an average of **13-15 hours** per incident and costs enterprise teams thousands of dollars in lost productivity and stale dashboards.
-
-**Kestra Aegis** automates the entire loop in seconds:
-*   **Intercept**: External pipelines POST failure telemetry to a secure Kestra webhook.
-*   **Classify**: Risk assessment rules evaluate the severity (LOW risk vs HIGH risk).
-*   **Diagnose**: Gemini 2.5 Flash reviews database schemas, error traces, and sample rows to generate exact, executable SQL fixes via a strict JSON schema.
-*   **Execute**: Aegis runs the fix inside containerized script runner environments with built-in retry policies.
-*   **Protect**: Interactive manual approval gates block destructive/structural actions, and an active safety engine catches unauthorized queries (like `DROP`, `DELETE`, `TRUNCATE`).
-*   **Document**: Comprehensive post-mortems are generated and logged.
+Built with **Kestra**, **DuckDB**, and **Gemini 2.5 Flash**.
 
 ---
 
-## 🏗️ Technical Architecture
+## 🧠 What Makes This Different
 
-Aegis handles failures dynamically based on the assessed risk level:
+Most pipeline observability tools (Monte Carlo, Bigeye) can **detect** failures and send Slack alerts. Kestra Aegis goes three steps further:
+
+| Capability | Existing Tools | Kestra Aegis |
+|-----------|---------------|--------------|
+| **Detect** failures | ✅ | ✅ |
+| **Diagnose** root cause with AI | ❌ | ✅ Gemini AI |
+| **Fix** the issue automatically | ❌ | ✅ Safe SQL/Python execution |
+| **Learn** from past fixes | ❌ | ✅ Fix Memory system |
+| **Correlate** related incidents | ❌ | ✅ Incident correlation engine |
+| **Predict** failures proactively | ❌ | ✅ Anomaly monitor |
+
+---
+
+## 🏗️ Architecture
 
 ```mermaid
 graph TD
-    A[Failing Pipeline Telemetry] -->|HTTP POST| B[Kestra Webhook Trigger]
-    B --> C[1. Classify Risk Level]
-    C --> D[2. Real Gemini AI Diagnosis]
-    D --> E{3. Risk Router}
+    A[Pipeline Failure Telemetry] -->|HTTP POST| B[Kestra Webhook]
+    B --> C[1. Classify Risk]
+    C --> D[2. Log Incident]
+    D --> E{3. Check Fix Memory}
     
-    E -->|LOW Risk| F[4a. Auto-Remediate]
-    E -->|HIGH Risk| G[4b. Pause for Human Review]
+    E -->|MEMORY HIT| F[Use Proven Fix]
+    E -->|MEMORY MISS| G[4. Gemini AI Diagnosis]
     
-    G -->|Approve| H[Execute Approved Fix]
-    G -->|Reject| I[Escalate to Admin]
+    G -->|with incident correlation| G
     
-    F --> J[5. Generate Incident Post-Mortem]
-    H --> J
-    I --> K[Log Escalation Alert]
+    F --> H{5. Risk Router}
+    G --> H
     
-    J --> L[6. Optional Slack Notification]
+    H -->|LOW Risk| I[Auto-Remediate]
+    H -->|HIGH Risk| J[Pause for Human Review]
+    
+    J -->|Approve| K[Execute Approved Fix]
+    J -->|Reject| L[Escalate]
+    
+    I --> M[6. Store Fix in Memory]
+    K --> M
+    
+    M --> N[7. Post-Mortem + Stats]
+    
+    O[Anomaly Monitor] -->|Scheduled| P[Check Data Quality]
+    P -->|Anomaly Found| A
 ```
+
+### The Learning Loop
+
+This is the core innovation. Every time Aegis successfully fixes a problem:
+
+1. The fix is stored in `fix_history` with an error signature
+2. Next time a similar error occurs, the memory is checked first
+3. If a proven fix exists → it's applied instantly (no LLM call, zero latency, guaranteed to work)
+4. If no match → Gemini diagnoses, and the new fix is stored for next time
+
+**The system gets faster and more reliable with every incident it resolves.**
+
+### Incident Correlation
+
+When multiple pipelines fail within a 10-minute window, Aegis doesn't treat them independently. It:
+1. Logs every incident in `incident_log` with timestamps
+2. When diagnosing a new failure, queries recent incidents
+3. Feeds ALL recent incidents to Gemini together
+4. Gemini identifies shared root causes across failures
+
+### Proactive Anomaly Detection
+
+The `anomaly_monitor` flow checks data quality metrics against stored baselines:
+- Row counts, null percentages, value ranges
+- If any metric is out of range → triggers self-healing BEFORE dashboards break
 
 ---
 
 ## 🚀 Quick Start
 
-Get Kestra Aegis running locally in 3 simple steps:
-
-### 1. Clone the Repository
+### 1. Clone
 ```bash
 git clone https://github.com/deemanth05/KESTRA-AEGIS.git
 cd KESTRA-AEGIS
 ```
 
-### 2. Set Up Environment Variables
-Copy the configuration template and insert your Gemini API Key from Google AI Studio:
+### 2. Configure
 ```bash
 cp .env.example .env
-# Edit .env and set GEMINI_API_KEY=your-gemini-key
+# Edit .env → set GEMINI_API_KEY from https://aistudio.google.com
 ```
 
-### 3. Launch Kestra
-Start Kestra and PostgreSQL in the background:
+### 3. Launch
 ```bash
 docker compose up -d
 ```
-Once healthy, access Kestra at **[http://localhost:8080](http://localhost:8080)** and log in using the credentials:
-*   **Username**: `admin@kestra.io`
-*   **Password**: `Admin1234!`
+Access Kestra at **http://localhost:8080** — Login: `admin@kestra.io` / `Admin1234!`
+
+### 4. Upload Flows
+Upload all `.yml` files from `flows/` into Kestra's Flow editor.
 
 ---
 
-## 💻 Running the Demo Scenarios
+## 💻 Demo Scenarios
 
-Aegis is loaded with 3 pre-built failure simulation scenarios. To run them:
+### Step A: Initialize Database
+Execute `setup_database` → creates `orders` table (15 rows) + `fix_history` + `incident_log` + `data_quality_baselines`.
 
-### Step A: Initialize the Demo Database
-In Kestra, locate and execute the `setup_database` flow. This creates a DuckDB table `orders` inside `/tmp/kestra-wd/pipeline.duckdb` and loads 15 clean transactional rows.
+### Step B: Run Scenarios
 
-### Step B: Trigger Failure Simulations
+#### Scenario 1: `TYPE_MISMATCH` (LOW Risk — Auto-Heals)
+- Injects a string into a DECIMAL column
+- Aegis diagnoses via Gemini → auto-executes SQL fix
+- **Run it twice** → second run uses MEMORY (no Gemini call!)
 
-#### Scenario 1: `TYPE_MISMATCH` (LOW Risk - Auto-Remediates)
-*   **Simulation**: Inject a text value (`'not_a_number'`) into a `DECIMAL` column.
-*   **Aegis Action**: Gemini diagnoses the type clash and suggests inserting the row with a `NULL` amount. Aegis automatically executes the SQL.
-*   **To Run**: Trigger `failure_simulator` in Kestra with input `failure_type=TYPE_MISMATCH`.
+#### Scenario 2: `NULL_VIOLATION` (LOW Risk — Auto-Heals)
+- Sets NULL in required column
+- Aegis generates cleanup query → auto-executes
 
-#### Scenario 2: `NULL_VIOLATION` (LOW Risk - Auto-Remediates)
-*   **Simulation**: Inject `NULL` values into a non-nullable column.
-*   **Aegis Action**: Gemini suggests updating all NULL fields to a default value (`0.00`) to preserve data quality. Aegis automatically executes the SQL.
-*   **To Run**: Trigger `failure_simulator` with input `failure_type=NULL_VIOLATION`.
+#### Scenario 3: `SCHEMA_DRIFT` (HIGH Risk — Human Approval)
+- Source has extra column not in target schema
+- Aegis proposes ALTER TABLE → **pauses for human approval**
+- Review in Kestra UI → Approve → fix executes
 
-#### Scenario 3: `SCHEMA_DRIFT` (HIGH Risk - Manual Approval Gate)
-*   **Simulation**: Ingestion source contains an extra column (`discount_code`) not yet present in the target database schema.
-*   **Aegis Action**: Flow classifies it as `HIGH` risk and **pauses**. In the Kestra UI, review Gemini's proposed fix (`ALTER TABLE orders ADD COLUMN discount_code VARCHAR;`), select **Approve**, and click **Resume**.
-*   **To Run**: Trigger `failure_simulator` with input `failure_type=SCHEMA_DRIFT`.
+#### Scenario 4: `DATA_ANOMALY` (HIGH Risk — Proactive Detection)
+- Mass-deletes rows simulating data loss
+- Also run `anomaly_monitor` separately to see proactive detection
 
----
+### Step C: Verify Memory Learning
+Run `TYPE_MISMATCH` twice:
+1. First run → diagnose shows `fix_source: AI` (Gemini called)
+2. Second run → diagnose shows `fix_source: MEMORY` (instant, no AI call)
 
-## 🛠️ Tech Stack & Dependencies
-
-*   **Orchestrator**: [Kestra](https://kestra.io) (Standalone Server, Webhook Triggers, Flow Control, Pause/Resume).
-*   **AI Engine**: [Google Gemini 2.5 Flash](https://aistudio.google.com) (Real AI diagnosis using structured JSON Outputs).
-*   **Database**: [DuckDB](https://duckdb.org) (Fast, file-based database mounted locally inside docker containers).
-*   **Docker**: Encapsulates Kestra environment and runs isolated python execution containers.
-
----
-
-## 🛡️ Active Safety & Validation Engine
-
-Aegis prioritizes database safety. The remediation engine (`scripts/remediate.py`) executes inside isolated Docker runners and runs static analysis on all SQL fixes:
-*   **Banned Keywords**: Any SQL statements containing `DROP`, `DELETE`, or `TRUNCATE` are instantly blocked.
-*   **Graceful Fallbacks**: If the Gemini API experiences network demand limits (HTTP 503) or JSON parsing fails, Aegis routes the exception to a high-risk manual review queue instead of failing the pipeline.
-*   **Transactional Integrity**: Retries with exponential backoffs are configured for all database operations to handle locking during write operations.
+The post-mortem shows memory stats: total fixes stored, cache hit rate.
 
 ---
 
-## 🏆 Kestra Features Showcased
+## 📊 Database Schema
 
-This project leverages the full power of Kestra:
-*   **Webhook Triggers**: Unauthenticated public endpoints created to receive data pipeline exceptions.
-*   **Pebble Templates & Coalescing**: Uses advanced Pebble logic (`??`) to handle variable resolution across dynamic execution branches.
-*   **Pause & Resume**: Employs human-in-the-loop interactive forms within Kestra's UI for structural adjustments.
-*   **Docker Task Runner**: Launches isolated, ephemeral container runtimes for python scripts, compiling dependencies (`duckdb`, `google-genai`) dynamically.
-*   **Error Event Handling**: Intercepts overall pipeline exceptions using global `errors` blocks to alert administrators.
+| Table | Purpose |
+|-------|---------|
+| `orders` | Demo pipeline data (15 rows of order data) |
+| `fix_history` | Learning memory — stores proven fixes with error signatures |
+| `incident_log` | Incident correlation — timestamped log of all incidents |
+| `data_quality_baselines` | Anomaly detection — expected metric ranges |
+
+---
+
+## 🛡️ Safety Engine
+
+- **Banned keywords**: SQL containing `DROP`, `DELETE`, or `TRUNCATE` is instantly blocked
+- **Sandboxed execution**: All code runs in ephemeral Docker containers
+- **Graceful fallbacks**: Gemini API failures route to manual review
+- **Exponential retry**: Database operations retry with backoff
+
+---
+
+## 🏆 Kestra Features Used
+
+| Feature | Usage |
+|---------|-------|
+| Webhook Triggers | Receives pipeline failure telemetry |
+| Python Script Tasks | Classification, diagnosis, remediation |
+| Docker Task Runner | Isolated execution with volume mounts |
+| Pause/Resume | Human-in-the-loop approval for HIGH risk fixes |
+| Switch/If | Risk-based routing |
+| Retry (Exponential) | Database operation resilience |
+| Global Error Handler | Catches flow-level failures |
+| Globals/Secrets | API key and Slack webhook management |
+| Multiple Flows | self_healing, failure_simulator, setup_database, anomaly_monitor |
 
 ---
 
 ## 📄 License
-This project is open-source and available under the [MIT License](LICENSE).
+MIT

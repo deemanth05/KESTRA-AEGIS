@@ -1,5 +1,9 @@
 id: setup_database
 namespace: aegis
+description: |
+  Initializes the DuckDB database with clean demo data and Aegis system tables.
+  Run this FIRST before any other Aegis flow.
+  Tables created: orders (demo data), fix_history (learning memory), incident_log (correlation), data_quality_baselines (anomaly detection).
 
 tasks:
   - id: init_duckdb
@@ -14,16 +18,17 @@ tasks:
     script: |
       import duckdb
       import os
+      import json
+      from datetime import datetime
 
-      # Ensure data directory exists inside the container
       os.makedirs("/app/data", exist_ok=True)
-
-      # Connect to the DuckDB file in the mounted directory
       db_path = "/app/data/pipeline.duckdb"
       print(f"Connecting to database at {db_path}...")
       con = duckdb.connect(db_path)
 
-      # Create schema and table
+      # ═══════════════════════════════════════════════════
+      # TABLE 1: orders (Demo Pipeline Data)
+      # ═══════════════════════════════════════════════════
       con.execute("""
         CREATE TABLE IF NOT EXISTS orders (
           order_id INTEGER PRIMARY KEY,
@@ -32,40 +37,123 @@ tasks:
           order_date DATE
         )
       """)
+      con.execute("DELETE FROM orders")
 
-      # Truncate to ensure clean run
-      con.execute("TRUNCATE TABLE orders")
+      orders_data = [
+          (1, 'Alice Smith', 120.50, '2026-06-01'),
+          (2, 'Bob Johnson', 45.00, '2026-06-01'),
+          (3, 'Charlie Brown', 350.75, '2026-06-02'),
+          (4, 'Diana Prince', 99.99, '2026-06-02'),
+          (5, 'Evan Wright', 12.50, '2026-06-02'),
+          (6, 'Fiona Gallagher', 88.40, '2026-06-03'),
+          (7, 'George Costanza', 150.00, '2026-06-03'),
+          (8, 'Hannah Abbott', 62.10, '2026-06-03'),
+          (9, 'Ian Malcolm', 210.00, '2026-06-04'),
+          (10, 'Julia Roberts', 75.25, '2026-06-04'),
+          (11, 'Kevin Bacon', 19.99, '2026-06-04'),
+          (12, 'Laura Croft', 500.00, '2026-06-05'),
+          (13, 'Michael Scott', 15.45, '2026-06-05'),
+          (14, 'Nora Jones', 135.00, '2026-06-05'),
+          (15, 'Oscar Martinez', 90.80, '2026-06-05'),
+      ]
+      con.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", orders_data)
+      order_count = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+      print(f"✅ Loaded {order_count} rows into 'orders' table.")
 
-      # Inline clean CSV data
-      csv_data = """order_id,customer_name,amount,order_date
-      1,Alice Smith,120.50,2026-06-01
-      2,Bob Johnson,45.00,2026-06-01
-      3,Charlie Brown,350.75,2026-06-02
-      4,Diana Prince,99.99,2026-06-02
-      5,Evan Wright,12.50,2026-06-02
-      6,Fiona Gallagher,88.40,2026-06-03
-      7,George Costanza,150.00,2026-06-03
-      8,Hannah Abbott,62.10,2026-06-03
-      9,Ian Malcolm,210.00,2026-06-04
-      10,Julia Roberts,75.25,2026-06-04
-      11,Kevin Bacon,19.99,2026-06-04
-      12,Laura Croft,500.00,2026-06-05
-      13,Michael Scott,15.45,2026-06-05
-      14,Nora Jones,135.00,2026-06-05
-      15,Oscar Martinez,90.80,2026-06-05"""
+      # ═══════════════════════════════════════════════════
+      # TABLE 2: fix_history (Learning Memory System)
+      # Stores every successful fix. Before calling Gemini,
+      # the system checks here first for a proven fix.
+      # ═══════════════════════════════════════════════════
+      con.execute("""
+        CREATE TABLE IF NOT EXISTS fix_history (
+          id INTEGER PRIMARY KEY,
+          error_signature VARCHAR,
+          error_type VARCHAR,
+          affected_table VARCHAR,
+          error_message_pattern VARCHAR,
+          fix_type VARCHAR,
+          fix_code VARCHAR,
+          root_cause VARCHAR,
+          explanation VARCHAR,
+          confidence DOUBLE,
+          risk_assessment VARCHAR,
+          success BOOLEAN DEFAULT TRUE,
+          applied_count INTEGER DEFAULT 1,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      """)
+      con.execute("DELETE FROM fix_history")
+      print("✅ Created 'fix_history' table (learning memory).")
 
-      # Clean lines
-      lines = [line.strip() for line in csv_data.strip().split("\n")]
-      rows = []
-      for line in lines[1:]:
-          parts = line.split(",")
-          rows.append((int(parts[0]), parts[1], float(parts[2]), parts[3]))
+      # ═══════════════════════════════════════════════════
+      # TABLE 3: incident_log (Incident Correlation)
+      # Logs every incident for time-window correlation.
+      # When multiple incidents cluster, Gemini analyzes
+      # them together to find the shared root cause.
+      # ═══════════════════════════════════════════════════
+      con.execute("""
+        CREATE TABLE IF NOT EXISTS incident_log (
+          id INTEGER PRIMARY KEY,
+          pipeline_name VARCHAR,
+          error_type VARCHAR,
+          error_message VARCHAR,
+          affected_table VARCHAR,
+          risk_level VARCHAR,
+          status VARCHAR DEFAULT 'PENDING',
+          root_cause VARCHAR,
+          fix_code VARCHAR,
+          fix_source VARCHAR,
+          correlation_id VARCHAR,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          resolved_at TIMESTAMP
+        )
+      """)
+      con.execute("DELETE FROM incident_log")
+      print("✅ Created 'incident_log' table (correlation engine).")
 
-      # Insert clean data
-      con.executemany("INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?)", rows)
+      # ═══════════════════════════════════════════════════
+      # TABLE 4: data_quality_baselines (Anomaly Detection)
+      # Stores expected metrics for each table so the
+      # anomaly monitor can compare current vs expected.
+      # ═══════════════════════════════════════════════════
+      con.execute("""
+        CREATE TABLE IF NOT EXISTS data_quality_baselines (
+          id INTEGER PRIMARY KEY,
+          table_name VARCHAR,
+          metric_name VARCHAR,
+          expected_min DOUBLE,
+          expected_max DOUBLE,
+          description VARCHAR,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      """)
+      con.execute("DELETE FROM data_quality_baselines")
 
-      # Print count to verify
-      res = con.execute("SELECT COUNT(*) FROM orders").fetchone()
-      print(f"Successfully loaded {res[0]} rows into 'orders' table.")
-      
+      baselines = [
+          (1, 'orders', 'row_count', 10, 10000, 'Expected row count range'),
+          (2, 'orders', 'null_amount_pct', 0, 5.0, 'Max acceptable NULL percentage in amount column'),
+          (3, 'orders', 'avg_amount', 10.0, 1000.0, 'Expected average order amount range'),
+          (4, 'orders', 'min_amount', 0.0, 50.0, 'Expected minimum order amount'),
+          (5, 'orders', 'max_amount', 50.0, 5000.0, 'Expected maximum order amount'),
+      ]
+      con.executemany("INSERT INTO data_quality_baselines VALUES (?, ?, ?, ?, ?, ?)", baselines)
+      print("✅ Created 'data_quality_baselines' table with 5 baseline rules.")
+
+      # ═══════════════════════════════════════════════════
+      # Summary
+      # ═══════════════════════════════════════════════════
+      tables = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'").fetchall()
+      table_names = [t[0] for t in tables]
+      print(f"\n📊 Database initialized with {len(table_names)} tables: {', '.join(table_names)}")
+
+      summary = {
+          "tables_created": len(table_names),
+          "table_names": ", ".join(table_names),
+          "orders_loaded": order_count
+      }
+      print(f"::{json.dumps({'outputs': summary})}::", flush=True)
+
       con.close()
+      print("\n🎯 Database setup complete. Ready for Aegis operations.")

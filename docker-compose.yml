@@ -66,8 +66,8 @@ services:
           url: http://localhost:8080/
           variables:
             globals:
-              GEMINI_API_KEY: "${GEMINI_API_KEY}"
-              SLACK_WEBHOOK_URL: "${SLACK_WEBHOOK_URL:-}"
+              gemini-api-key: "${GEMINI_API_KEY}"
+              slack-webhook-url: "${SLACK_WEBHOOK_URL:-}"
     ports:
       - "8080:8080"
       - "8081:8081"

@@ -1,5 +1,16 @@
 id: self_healing
 namespace: aegis
+description: |
+  Kestra Aegis — Self-Healing Pipeline Orchestrator
+  
+  When a pipeline fails, this flow:
+  1. Classifies the error risk level (LOW/HIGH)
+  2. Logs the incident for correlation analysis
+  3. Checks Fix Memory for a proven past fix (skips AI if found)
+  4. If no memory hit → calls Gemini AI with recent incident context for correlation
+  5. Routes: LOW risk → auto-remediate | HIGH risk → human approval gate
+  6. After successful fix → stores fix in memory for future reuse
+  7. Generates a structured post-mortem with memory stats
 
 inputs:
   - id: pipeline_name
@@ -23,7 +34,9 @@ inputs:
     defaults: ""
 
 tasks:
-  # ── Step 1: Classify Error Risk ──────────────────
+  # ══════════════════════════════════════════════════════════
+  # STEP 1: Classify Error Risk Level
+  # ══════════════════════════════════════════════════════════
   - id: classify_error
     type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.11-slim
@@ -31,15 +44,13 @@ tasks:
       ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
       ERROR_MESSAGE: "{{ trigger.body.error_message ?? inputs.error_message }}"
     script: |
-      import argparse
       import json
       import os
 
       error_type = os.getenv("ERROR_TYPE", "UNKNOWN").upper()
       error_msg = os.getenv("ERROR_MESSAGE", "")
 
-      # Rule-based risk assessment mapping
-      HIGH_RISK_TYPES = ["SCHEMA_DRIFT", "DATA_LOSS", "PERMISSION_ERROR"]
+      HIGH_RISK_TYPES = ["SCHEMA_DRIFT", "DATA_LOSS", "PERMISSION_ERROR", "DATA_ANOMALY"]
       LOW_RISK_TYPES = ["TYPE_MISMATCH", "NULL_VIOLATION", "API_TIMEOUT", "STALE_DATA"]
 
       if error_type in HIGH_RISK_TYPES:
@@ -54,15 +65,27 @@ tasks:
           "error_type": error_type,
           "error_message": error_msg
       }
-
       print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
 
-  # ── Step 2: Diagnose (Real Gemini API) ──────────
+  # ══════════════════════════════════════════════════════════
+  # STEP 2: Memory Lookup + Incident Logging + AI Diagnosis
+  # 
+  # This is the brain of Aegis. It:
+  #   a) Logs the incident to incident_log for correlation
+  #   b) Generates an error signature and checks fix_history
+  #   c) If MEMORY HIT → uses the proven fix (no Gemini call)
+  #   d) If MEMORY MISS → pulls recent incidents for context,
+  #      calls Gemini with full correlation data
+  # ══════════════════════════════════════════════════════════
   - id: diagnose
     type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.11-slim
     beforeCommands:
-      - pip install google-genai
+      - pip install google-genai duckdb
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - /tmp/kestra-wd:/app/data
     env:
       GEMINI_API_KEY: "{{ globals['gemini-api-key'] }}"
       PIPELINE_NAME: "{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}"
@@ -71,87 +94,239 @@ tasks:
       AFFECTED_TABLE: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
       SCHEMA_INFO: "{{ trigger.body.schema_info ?? inputs.schema_info }}"
       SAMPLE_DATA: "{{ trigger.body.sample_data ?? inputs.sample_data }}"
+      STACK_TRACE: "{{ trigger.body.stack_trace ?? inputs.stack_trace }}"
     script: |
       import os
       import sys
       import json
-      from google import genai
-      from google.genai import types
+      import hashlib
+      from datetime import datetime
+
+      def generate_error_signature(error_type, affected_table, error_message):
+          """Create a stable signature for matching similar errors."""
+          # Normalize: strip numbers, IDs, and timestamps for fuzzy matching
+          normalized_msg = error_message.lower().strip()
+          # Remove specific row IDs and values to match pattern, not instance
+          for char in '0123456789':
+              normalized_msg = normalized_msg.replace(char, '#')
+          raw = f"{error_type}|{affected_table}|{normalized_msg}"
+          return hashlib.md5(raw.encode()).hexdigest()
 
       def main():
           api_key = os.getenv("GEMINI_API_KEY")
-          if not api_key:
-              print("Error: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
-              sys.exit(1)
-
           pipeline_name = os.getenv("PIPELINE_NAME", "unknown")
-          error_type = os.getenv("ERROR_TYPE", "UNKNOWN")
+          error_type = os.getenv("ERROR_TYPE", "UNKNOWN").upper()
           error_message = os.getenv("ERROR_MESSAGE", "")
           affected_table = os.getenv("AFFECTED_TABLE", "unknown")
           schema_info = os.getenv("SCHEMA_INFO", "")
           sample_data = os.getenv("SAMPLE_DATA", "")
+          stack_trace = os.getenv("STACK_TRACE", "")
 
-          prompt = f"""
-      You are Kestra Aegis, an automated self-healing pipeline assistant.
-      Your task is to analyze a failed data pipeline run and generate a fix.
+          db_path = "/app/data/pipeline.duckdb"
+          fix_source = "AI"
+          correlation_notes = ""
+          memory_stats = {"total_fixes_stored": 0, "cache_hit_rate": "N/A"}
 
-      Failure details:
-      - Pipeline Name: {pipeline_name}
-      - Error Type: {error_type}
-      - Error Message: {error_message}
-      - Affected Table: {affected_table}
-      - Schema Info: {schema_info}
-      - Sample Data: {sample_data}
-
-      Target Database is DuckDB. Use DuckDB-compatible SQL syntax.
-      Never generate DROP, DELETE, or TRUNCATE statements.
-
-      If the fix is a SQL query, set fix_type to 'SQL' and fix_code to the SQL statement.
-      If the fix is a python script, set fix_type to 'PYTHON' and fix_code to the Python script.
-      If the pipeline should be retried later, set fix_type to 'RETRY'.
-      If the error is unknown or cannot be fixed safely, set fix_type to 'SKIP' and risk_assessment to 'HIGH'.
-      """
-
+          # ── Connect to DuckDB ──────────────────────────
+          import duckdb
+          con = None
           try:
-              client = genai.Client(api_key=api_key)
-              response = client.models.generate_content(
-                  model='gemini-2.5-flash',
-                  contents=prompt,
-                  config=types.GenerateContentConfig(
-                      response_mime_type="application/json",
-                      response_schema=types.Schema(
-                          type=types.Type.OBJECT,
-                          properties={
-                              "root_cause": types.Schema(type=types.Type.STRING),
-                              "fix_type": types.Schema(type=types.Type.STRING, enum=["SQL", "PYTHON", "RETRY", "SKIP"]),
-                              "fix_code": types.Schema(type=types.Type.STRING),
-                              "explanation": types.Schema(type=types.Type.STRING),
-                              "confidence": types.Schema(type=types.Type.NUMBER),
-                              "risk_assessment": types.Schema(type=types.Type.STRING, enum=["LOW", "HIGH"])
-                          },
-                          required=["root_cause", "fix_type", "fix_code", "explanation", "confidence", "risk_assessment"]
+              if os.path.exists(db_path):
+                  con = duckdb.connect(db_path)
+              else:
+                  print("Warning: Database not found, skipping memory lookup.", file=sys.stderr)
+          except Exception as e:
+              print(f"Warning: Could not connect to DB for memory: {e}", file=sys.stderr)
+
+          error_signature = generate_error_signature(error_type, affected_table, error_message)
+          incident_id = None
+
+          if con:
+              try:
+                  # ── LOG INCIDENT ─────────────────────────
+                  # Get next ID
+                  max_id = con.execute("SELECT COALESCE(MAX(id), 0) FROM incident_log").fetchone()[0]
+                  incident_id = max_id + 1
+                  con.execute("""
+                      INSERT INTO incident_log (id, pipeline_name, error_type, error_message, affected_table, risk_level, status, created_at)
+                      VALUES (?, ?, ?, ?, ?, ?, 'PENDING', CURRENT_TIMESTAMP)
+                  """, [incident_id, pipeline_name, error_type, error_message[:500], affected_table, "PENDING"])
+                  print(f"📝 Incident #{incident_id} logged.")
+
+                  # ── MEMORY LOOKUP ───────────────────────
+                  print(f"🔍 Checking fix memory (signature: {error_signature[:12]}...)...")
+                  cached = con.execute("""
+                      SELECT fix_type, fix_code, root_cause, explanation, confidence, risk_assessment, applied_count
+                      FROM fix_history
+                      WHERE error_signature = ? AND success = TRUE
+                      ORDER BY applied_count DESC, last_applied_at DESC
+                      LIMIT 1
+                  """, [error_signature]).fetchone()
+
+                  # Memory stats
+                  total_fixes = con.execute("SELECT COUNT(*) FROM fix_history WHERE success = TRUE").fetchone()[0]
+                  total_incidents = con.execute("SELECT COUNT(*) FROM incident_log").fetchone()[0]
+                  cache_hits = con.execute("SELECT COUNT(*) FROM incident_log WHERE fix_source = 'MEMORY'").fetchone()[0]
+                  hit_rate = f"{(cache_hits / max(total_incidents - 1, 1)) * 100:.0f}%" if total_incidents > 1 else "N/A"
+                  memory_stats = {
+                      "total_fixes_stored": total_fixes,
+                      "total_incidents": total_incidents,
+                      "cache_hits": cache_hits,
+                      "cache_hit_rate": hit_rate
+                  }
+
+                  if cached:
+                      fix_type, fix_code, root_cause, explanation, confidence, risk_assessment, applied_count = cached
+                      print(f"✅ MEMORY HIT! Found proven fix (applied {applied_count}x before). Skipping Gemini.")
+                      fix_source = "MEMORY"
+
+                      # Update applied count and timestamp
+                      con.execute("""
+                          UPDATE fix_history
+                          SET applied_count = applied_count + 1, last_applied_at = CURRENT_TIMESTAMP
+                          WHERE error_signature = ? AND success = TRUE
+                      """, [error_signature])
+
+                      # Update incident with source
+                      con.execute("UPDATE incident_log SET fix_source = 'MEMORY' WHERE id = ?", [incident_id])
+
+                      result_json = {
+                          "root_cause": root_cause,
+                          "fix_type": fix_type,
+                          "fix_code": fix_code,
+                          "explanation": f"[FROM MEMORY — applied {applied_count + 1}x] {explanation}",
+                          "confidence": confidence,
+                          "risk_assessment": risk_assessment
+                      }
+                      outputs = {**result_json, "fix_source": fix_source, "error_signature": error_signature,
+                                 "incident_id": str(incident_id), "memory_stats": json.dumps(memory_stats),
+                                 "correlation_notes": ""}
+                      print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                      con.close()
+                      return
+
+                  print("❌ No memory hit. Calling Gemini AI for diagnosis...")
+
+                  # ── INCIDENT CORRELATION ────────────────
+                  # Pull recent incidents (last 10 minutes) for context
+                  recent = con.execute("""
+                      SELECT pipeline_name, error_type, error_message, affected_table, status, root_cause
+                      FROM incident_log
+                      WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL 10 MINUTE
+                        AND id != ?
+                      ORDER BY created_at DESC
+                      LIMIT 10
+                  """, [incident_id]).fetchall()
+
+                  if recent:
+                      correlation_notes = f"Found {len(recent)} related incidents in the last 10 minutes:\n"
+                      for r in recent:
+                          correlation_notes += f"  - [{r[1]}] {r[0]}.{r[3]} — {r[4]} — {r[2][:80]}\n"
+                      print(f"🔗 {len(recent)} recent incidents found for correlation context.")
+                  else:
+                      print("🔗 No recent incidents for correlation.")
+
+                  # Update incident source
+                  con.execute("UPDATE incident_log SET fix_source = 'AI' WHERE id = ?", [incident_id])
+
+              except Exception as e:
+                  print(f"Warning: Memory/correlation error (non-fatal): {e}", file=sys.stderr)
+                  import traceback
+                  traceback.print_exc(file=sys.stderr)
+
+          # ── GEMINI AI DIAGNOSIS ─────────────────────────
+          if not api_key:
+              print("Error: GEMINI_API_KEY not set.", file=sys.stderr)
+              result_json = {
+                  "root_cause": "GEMINI_API_KEY not configured",
+                  "fix_type": "SKIP", "fix_code": "",
+                  "explanation": "Cannot diagnose without API key.",
+                  "confidence": 0.0, "risk_assessment": "HIGH"
+              }
+          else:
+              try:
+                  from google import genai
+                  from google.genai import types
+
+                  correlation_section = ""
+                  if correlation_notes:
+                      correlation_section = f"""
+          IMPORTANT — INCIDENT CORRELATION CONTEXT:
+          There are other recent failures in the system. Analyze whether this failure
+          is related to any of them. If they share a common root cause, mention it.
+          {correlation_notes}
+          """
+
+                  prompt = f"""
+          You are Kestra Aegis, an automated self-healing data pipeline assistant.
+          Analyze this failure and generate an executable fix.
+
+          Current Failure:
+          - Pipeline: {pipeline_name}
+          - Error Type: {error_type}
+          - Error Message: {error_message}
+          - Affected Table: {affected_table}
+          - Schema: {schema_info}
+          - Sample Data: {sample_data}
+          - Stack Trace: {stack_trace}
+          {correlation_section}
+          Target database is DuckDB. Use DuckDB-compatible SQL syntax.
+          NEVER generate DROP, DELETE, or TRUNCATE statements.
+          If multiple related errors exist, identify the shared root cause.
+          """
+
+                  client = genai.Client(api_key=api_key)
+                  response = client.models.generate_content(
+                      model='gemini-2.5-flash',
+                      contents=prompt,
+                      config=types.GenerateContentConfig(
+                          response_mime_type="application/json",
+                          response_schema=types.Schema(
+                              type=types.Type.OBJECT,
+                              properties={
+                                  "root_cause": types.Schema(type=types.Type.STRING),
+                                  "fix_type": types.Schema(type=types.Type.STRING, enum=["SQL", "PYTHON", "RETRY", "SKIP"]),
+                                  "fix_code": types.Schema(type=types.Type.STRING),
+                                  "explanation": types.Schema(type=types.Type.STRING),
+                                  "confidence": types.Schema(type=types.Type.NUMBER),
+                                  "risk_assessment": types.Schema(type=types.Type.STRING, enum=["LOW", "HIGH"])
+                              },
+                              required=["root_cause", "fix_type", "fix_code", "explanation", "confidence", "risk_assessment"]
+                          )
                       )
                   )
-              )
-              
-              result_json = json.loads(response.text)
-          except Exception as e:
-              print(f"Gemini API or Parse Error: {e}", file=sys.stderr)
-              result_json = {
-                  "root_cause": f"Error during Gemini diagnosis: {str(e)}",
-                  "fix_type": "SKIP",
-                  "fix_code": "",
-                  "explanation": "Aegis failed to diagnose the issue using Gemini API.",
-                  "confidence": 0.0,
-                  "risk_assessment": "HIGH"
-              }
+                  result_json = json.loads(response.text)
+                  print(f"🤖 Gemini diagnosis complete. Confidence: {result_json.get('confidence', 'N/A')}")
 
-          print(f"::{json.dumps({'outputs': result_json})}::", flush=True)
+              except Exception as e:
+                  print(f"Gemini error: {e}", file=sys.stderr)
+                  result_json = {
+                      "root_cause": f"Gemini diagnosis failed: {str(e)}",
+                      "fix_type": "SKIP", "fix_code": "",
+                      "explanation": "AI diagnosis failed. Manual intervention required.",
+                      "confidence": 0.0, "risk_assessment": "HIGH"
+                  }
+
+          fix_source = "AI"
+          outputs = {
+              **result_json,
+              "fix_source": fix_source,
+              "error_signature": error_signature,
+              "incident_id": str(incident_id) if incident_id else "0",
+              "memory_stats": json.dumps(memory_stats),
+              "correlation_notes": correlation_notes[:500] if correlation_notes else ""
+          }
+          print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+
+          if con:
+              con.close()
 
       if __name__ == "__main__":
           main()
 
-  # ── Step 3: Risk Gate routing ─────────────────────
+  # ══════════════════════════════════════════════════════════
+  # STEP 3: Risk Gate — Route by Risk Level
+  # ══════════════════════════════════════════════════════════
   - id: risk_gate
     type: io.kestra.plugin.core.flow.Switch
     value: "{{ outputs.classify_error.vars.risk_level }}"
@@ -174,6 +349,15 @@ tasks:
           env:
             FIX_TYPE: "{{ outputs.diagnose.vars.fix_type }}"
             FIX_CODE: "{{ outputs.diagnose.vars.fix_code }}"
+            ERROR_SIGNATURE: "{{ outputs.diagnose.vars.error_signature }}"
+            INCIDENT_ID: "{{ outputs.diagnose.vars.incident_id }}"
+            FIX_SOURCE: "{{ outputs.diagnose.vars.fix_source }}"
+            ROOT_CAUSE: "{{ outputs.diagnose.vars.root_cause }}"
+            EXPLANATION: "{{ outputs.diagnose.vars.explanation }}"
+            CONFIDENCE: "{{ outputs.diagnose.vars.confidence }}"
+            RISK_ASSESSMENT: "{{ outputs.diagnose.vars.risk_assessment }}"
+            ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
+            AFFECTED_TABLE: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
           script: |
             import os
             import sys
@@ -184,108 +368,123 @@ tasks:
                 fix_type = os.getenv("FIX_TYPE", "SKIP").upper()
                 fix_code = os.getenv("FIX_CODE", "").strip()
                 db_path = "/app/data/pipeline.duckdb"
+                error_signature = os.getenv("ERROR_SIGNATURE", "")
+                incident_id = os.getenv("INCIDENT_ID", "0")
+                fix_source = os.getenv("FIX_SOURCE", "AI")
 
                 if not fix_code:
-                    print("No fix code provided.", file=sys.stderr)
-                    outputs = {
-                        "status": "SKIPPED",
-                        "method": "NONE",
-                        "error_message": "No fix code provided."
-                    }
+                    outputs = {"status": "SKIPPED", "method": "NONE", "error_message": "No fix code provided."}
                     print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                     sys.exit(0)
 
                 # Safety Check
                 code_lower = fix_code.lower()
-                banned_keywords = ["drop ", "delete ", "truncate "]
-                for word in banned_keywords:
+                for word in ["drop ", "delete ", "truncate "]:
                     if word in code_lower:
-                        err_msg = f"Safety violation: code contains banned keyword '{word.strip().upper()}'"
-                        print(err_msg, file=sys.stderr)
-                        outputs = {
-                            "status": "FAILED",
-                            "method": "SAFETY_CHECK",
-                            "error_message": err_msg
-                        }
+                        err_msg = f"Safety violation: banned keyword '{word.strip().upper()}'"
+                        outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
                         print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                         sys.exit(1)
 
-                # Execution
-                if fix_type == "SQL":
-                    if not os.path.exists(db_path):
-                        err_msg = f"Database file not found at {db_path}."
-                        print(err_msg, file=sys.stderr)
-                        outputs = {
-                            "status": "FAILED",
-                            "method": "AUTO_SQL",
-                            "error_message": err_msg
-                        }
-                        print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                        sys.exit(1)
+                con = None
+                try:
+                    if fix_type == "SQL":
+                        if not os.path.exists(db_path):
+                            outputs = {"status": "FAILED", "method": "AUTO_SQL", "error_message": f"DB not found at {db_path}"}
+                            print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                            sys.exit(1)
 
-                    print(f"Connecting to DuckDB at {db_path}...")
-                    con = duckdb.connect(db_path)
-                    try:
+                        con = duckdb.connect(db_path)
                         print(f"Executing SQL Fix:\n{fix_code}")
                         con.execute(fix_code)
-                        print("SQL executed successfully.")
-                        outputs = {
-                            "status": "FIXED",
-                            "method": "AUTO_SQL",
-                            "executed_code": fix_code
-                        }
-                    except Exception as e:
-                        err_msg = f"SQL error: {str(e)}"
-                        print(err_msg, file=sys.stderr)
-                        outputs = {
-                            "status": "FAILED",
-                            "method": "AUTO_SQL",
-                            "error_message": err_msg
-                        }
-                    finally:
+                        print("✅ SQL executed successfully.")
+                        outputs = {"status": "FIXED", "method": "AUTO_SQL", "executed_code": fix_code}
+
+                        # ── STORE IN FIX MEMORY ──────────────
+                        if fix_source == "AI" and error_signature:
+                            try:
+                                existing = con.execute(
+                                    "SELECT id FROM fix_history WHERE error_signature = ?", [error_signature]
+                                ).fetchone()
+                                if not existing:
+                                    max_id = con.execute("SELECT COALESCE(MAX(id), 0) FROM fix_history").fetchone()[0]
+                                    con.execute("""
+                                        INSERT INTO fix_history (id, error_signature, error_type, affected_table,
+                                            error_message_pattern, fix_type, fix_code, root_cause, explanation,
+                                            confidence, risk_assessment, success, applied_count)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 1)
+                                    """, [
+                                        max_id + 1, error_signature,
+                                        os.getenv("ERROR_TYPE", ""), os.getenv("AFFECTED_TABLE", ""),
+                                        os.getenv("ROOT_CAUSE", "")[:200],
+                                        fix_type, fix_code,
+                                        os.getenv("ROOT_CAUSE", ""), os.getenv("EXPLANATION", ""),
+                                        float(os.getenv("CONFIDENCE", "0")),
+                                        os.getenv("RISK_ASSESSMENT", "HIGH")
+                                    ])
+                                    print("🧠 Fix stored in memory for future reuse!")
+                                else:
+                                    print("🧠 Fix already in memory, updated applied count.")
+                            except Exception as e:
+                                print(f"Warning: Could not store fix in memory: {e}", file=sys.stderr)
+
+                        # ── UPDATE INCIDENT LOG ──────────────
+                        try:
+                            if incident_id != "0":
+                                con.execute("""
+                                    UPDATE incident_log
+                                    SET status = 'FIXED', root_cause = ?, fix_code = ?, resolved_at = CURRENT_TIMESTAMP
+                                    WHERE id = ?
+                                """, [os.getenv("ROOT_CAUSE", ""), fix_code, int(incident_id)])
+                                print(f"📋 Incident #{incident_id} marked as FIXED.")
+                        except Exception as e:
+                            print(f"Warning: Could not update incident log: {e}", file=sys.stderr)
+
+                    elif fix_type == "PYTHON":
+                        print(f"Executing Python Fix:\n{fix_code}")
+                        exec(fix_code, {}, {})
+                        print("✅ Python executed successfully.")
+                        outputs = {"status": "FIXED", "method": "AUTO_PYTHON", "executed_code": fix_code}
+
+                    else:
+                        outputs = {"status": "SKIPPED", "method": fix_type, "error_message": f"Skipped for type: {fix_type}"}
+
+                except duckdb.Error as e:
+                    outputs = {"status": "FAILED", "method": "AUTO_SQL", "error_message": f"SQL error: {str(e)}"}
+                    # Mark incident as failed
+                    try:
+                        if con and incident_id != "0":
+                            con.execute("UPDATE incident_log SET status = 'FAILED' WHERE id = ?", [int(incident_id)])
+                    except:
+                        pass
+                except Exception as e:
+                    outputs = {"status": "FAILED", "method": fix_type, "error_message": str(e)}
+                finally:
+                    if con:
                         con.close()
 
-                elif fix_type == "PYTHON":
-                    print(f"Executing Python Fix:\n{fix_code}")
-                    try:
-                        local_vars = {}
-                        exec(fix_code, globals(), local_vars)
-                        print("Python code executed successfully.")
-                        outputs = {
-                            "status": "FIXED",
-                            "method": "AUTO_PYTHON",
-                            "executed_code": fix_code
-                        }
-                    except Exception as e:
-                        err_msg = f"Python error: {str(e)}"
-                        print(err_msg, file=sys.stderr)
-                        outputs = {
-                            "status": "FAILED",
-                            "method": "AUTO_PYTHON",
-                            "error_message": err_msg
-                        }
-
-                else:
-                    outputs = {
-                        "status": "SKIPPED",
-                        "method": fix_type,
-                        "error_message": f"Execution skipped for fix type: {fix_type}."
-                    }
-
-                # Write output to Kestra format
                 print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                if outputs["status"] == "FAILED":
+                if outputs.get("status") == "FAILED":
                     sys.exit(1)
 
             if __name__ == "__main__":
                 main()
+
       HIGH:
         - id: human_approval
           type: io.kestra.plugin.core.flow.Pause
           description: |
+            🛡️ HIGH RISK — Human Approval Required
+
+            Fix Source: {{ outputs.diagnose.vars.fix_source }}
             Gemini Diagnosis: {{ outputs.diagnose.vars.explanation }}
+            Root Cause: {{ outputs.diagnose.vars.root_cause }}
+            Confidence: {{ outputs.diagnose.vars.confidence }}
+
             Proposed Fix ({{ outputs.diagnose.vars.fix_type }}):
             {{ outputs.diagnose.vars.fix_code }}
+
+            {{ outputs.diagnose.vars.correlation_notes }}
           onResume:
             - id: approved
               type: BOOLEAN
@@ -316,6 +515,15 @@ tasks:
               env:
                 FIX_TYPE: "{{ outputs.diagnose.vars.fix_type }}"
                 FIX_CODE: "{{ outputs.diagnose.vars.fix_code }}"
+                ERROR_SIGNATURE: "{{ outputs.diagnose.vars.error_signature }}"
+                INCIDENT_ID: "{{ outputs.diagnose.vars.incident_id }}"
+                FIX_SOURCE: "{{ outputs.diagnose.vars.fix_source }}"
+                ROOT_CAUSE: "{{ outputs.diagnose.vars.root_cause }}"
+                EXPLANATION: "{{ outputs.diagnose.vars.explanation }}"
+                CONFIDENCE: "{{ outputs.diagnose.vars.confidence }}"
+                RISK_ASSESSMENT: "{{ outputs.diagnose.vars.risk_assessment }}"
+                ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
+                AFFECTED_TABLE: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
               script: |
                 import os
                 import sys
@@ -326,101 +534,105 @@ tasks:
                     fix_type = os.getenv("FIX_TYPE", "SKIP").upper()
                     fix_code = os.getenv("FIX_CODE", "").strip()
                     db_path = "/app/data/pipeline.duckdb"
+                    error_signature = os.getenv("ERROR_SIGNATURE", "")
+                    incident_id = os.getenv("INCIDENT_ID", "0")
+                    fix_source = os.getenv("FIX_SOURCE", "AI")
 
                     if not fix_code:
-                        print("No fix code provided.", file=sys.stderr)
-                        outputs = {
-                            "status": "SKIPPED",
-                            "method": "NONE",
-                            "error_message": "No fix code provided."
-                        }
+                        outputs = {"status": "SKIPPED", "method": "NONE", "error_message": "No fix code provided."}
                         print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                         sys.exit(0)
 
                     # Safety Check
                     code_lower = fix_code.lower()
-                    banned_keywords = ["drop ", "delete ", "truncate "]
-                    for word in banned_keywords:
+                    for word in ["drop ", "delete ", "truncate "]:
                         if word in code_lower:
-                            err_msg = f"Safety violation: code contains banned keyword '{word.strip().upper()}'"
-                            print(err_msg, file=sys.stderr)
-                            outputs = {
-                                "status": "FAILED",
-                                "method": "SAFETY_CHECK",
-                                "error_message": err_msg
-                            }
+                            err_msg = f"Safety violation: banned keyword '{word.strip().upper()}'"
+                            outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
                             print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                             sys.exit(1)
 
-                    # Execution
-                    if fix_type == "SQL":
-                        if not os.path.exists(db_path):
-                            err_msg = f"Database file not found at {db_path}."
-                            print(err_msg, file=sys.stderr)
-                            outputs = {
-                                "status": "FAILED",
-                                "method": "AUTO_SQL",
-                                "error_message": err_msg
-                            }
-                            print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                            sys.exit(1)
+                    con = None
+                    try:
+                        if fix_type == "SQL":
+                            if not os.path.exists(db_path):
+                                outputs = {"status": "FAILED", "method": "AUTO_SQL", "error_message": f"DB not found at {db_path}"}
+                                print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                                sys.exit(1)
 
-                        print(f"Connecting to DuckDB at {db_path}...")
-                        con = duckdb.connect(db_path)
-                        try:
+                            con = duckdb.connect(db_path)
                             print(f"Executing SQL Fix:\n{fix_code}")
                             con.execute(fix_code)
-                            print("SQL executed successfully.")
-                            outputs = {
-                                "status": "FIXED",
-                                "method": "AUTO_SQL",
-                                "executed_code": fix_code
-                            }
-                        except Exception as e:
-                            err_msg = f"SQL error: {str(e)}"
-                            print(err_msg, file=sys.stderr)
-                            outputs = {
-                                "status": "FAILED",
-                                "method": "AUTO_SQL",
-                                "error_message": err_msg
-                            }
-                        finally:
+                            print("✅ SQL executed successfully.")
+                            outputs = {"status": "FIXED", "method": "APPROVED_SQL", "executed_code": fix_code}
+
+                            # ── STORE IN FIX MEMORY ──────────────
+                            if fix_source == "AI" and error_signature:
+                                try:
+                                    existing = con.execute(
+                                        "SELECT id FROM fix_history WHERE error_signature = ?", [error_signature]
+                                    ).fetchone()
+                                    if not existing:
+                                        max_id = con.execute("SELECT COALESCE(MAX(id), 0) FROM fix_history").fetchone()[0]
+                                        con.execute("""
+                                            INSERT INTO fix_history (id, error_signature, error_type, affected_table,
+                                                error_message_pattern, fix_type, fix_code, root_cause, explanation,
+                                                confidence, risk_assessment, success, applied_count)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, 1)
+                                        """, [
+                                            max_id + 1, error_signature,
+                                            os.getenv("ERROR_TYPE", ""), os.getenv("AFFECTED_TABLE", ""),
+                                            os.getenv("ROOT_CAUSE", "")[:200],
+                                            fix_type, fix_code,
+                                            os.getenv("ROOT_CAUSE", ""), os.getenv("EXPLANATION", ""),
+                                            float(os.getenv("CONFIDENCE", "0")),
+                                            os.getenv("RISK_ASSESSMENT", "HIGH")
+                                        ])
+                                        print("🧠 Fix stored in memory for future reuse!")
+                                except Exception as e:
+                                    print(f"Warning: Could not store fix in memory: {e}", file=sys.stderr)
+
+                            # ── UPDATE INCIDENT LOG ──────────────
+                            try:
+                                if incident_id != "0":
+                                    con.execute("""
+                                        UPDATE incident_log
+                                        SET status = 'FIXED', root_cause = ?, fix_code = ?, resolved_at = CURRENT_TIMESTAMP
+                                        WHERE id = ?
+                                    """, [os.getenv("ROOT_CAUSE", ""), fix_code, int(incident_id)])
+                                    print(f"📋 Incident #{incident_id} marked as FIXED.")
+                            except Exception as e:
+                                print(f"Warning: Could not update incident log: {e}", file=sys.stderr)
+
+                        elif fix_type == "PYTHON":
+                            print(f"Executing Python Fix:\n{fix_code}")
+                            exec(fix_code, {}, {})
+                            print("✅ Python executed successfully.")
+                            outputs = {"status": "FIXED", "method": "APPROVED_PYTHON", "executed_code": fix_code}
+
+                        else:
+                            outputs = {"status": "SKIPPED", "method": fix_type, "error_message": f"Skipped for type: {fix_type}"}
+
+                    except duckdb.Error as e:
+                        outputs = {"status": "FAILED", "method": "APPROVED_SQL", "error_message": f"SQL error: {str(e)}"}
+                        try:
+                            if con and incident_id != "0":
+                                con.execute("UPDATE incident_log SET status = 'FAILED' WHERE id = ?", [int(incident_id)])
+                        except:
+                            pass
+                    except Exception as e:
+                        outputs = {"status": "FAILED", "method": fix_type, "error_message": str(e)}
+                    finally:
+                        if con:
                             con.close()
 
-                    elif fix_type == "PYTHON":
-                        print(f"Executing Python Fix:\n{fix_code}")
-                        try:
-                            local_vars = {}
-                            exec(fix_code, globals(), local_vars)
-                            print("Python code executed successfully.")
-                            outputs = {
-                                "status": "FIXED",
-                                "method": "AUTO_PYTHON",
-                                "executed_code": fix_code
-                            }
-                        except Exception as e:
-                            err_msg = f"Python error: {str(e)}"
-                            print(err_msg, file=sys.stderr)
-                            outputs = {
-                                "status": "FAILED",
-                                "method": "AUTO_PYTHON",
-                                "error_message": err_msg
-                            }
-
-                    else:
-                        outputs = {
-                            "status": "SKIPPED",
-                            "method": fix_type,
-                            "error_message": f"Execution skipped for fix type: {fix_type}."
-                        }
-
-                    # Write output to Kestra format
                     print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                    if outputs["status"] == "FAILED":
+                    if outputs.get("status") == "FAILED":
                         sys.exit(1)
 
                 if __name__ == "__main__":
                     main()
+
           else:
             - id: escalate
               type: io.kestra.plugin.core.log.Log
@@ -429,30 +641,37 @@ tasks:
                 Pipeline: {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
                 Reviewer notes: {{ outputs.human_approval.onResume.reviewer_notes }}
 
-  # ── Step 4: Incident Documentation ────────────────
+  # ══════════════════════════════════════════════════════════
+  # STEP 4: Post-Mortem with Memory & Correlation Stats
+  # ══════════════════════════════════════════════════════════
   - id: post_mortem
     type: io.kestra.plugin.core.log.Log
     message: |
       ════════════════════════════════════════════════════════════════
       📋 KESTRA AEGIS — INCIDENT POST-MORTEM
       ════════════════════════════════════════════════════════════════
-      🔴 PIPELINE FAILURE DETAILS:
+      🔴 PIPELINE FAILURE:
          • Pipeline:        {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
          • Error Type:      {{ trigger.body.error_type ?? inputs.error_type }}
          • Affected Table:  {{ trigger.body.affected_table ?? inputs.affected_table }}
-         • Schema Info:     {{ trigger.body.schema_info ?? inputs.schema_info }}
 
       🤖 AI DIAGNOSIS:
          • Root Cause:      {{ outputs.diagnose.vars.root_cause }}
          • Confidence:      {{ outputs.diagnose.vars.confidence }}
          • Explanation:     {{ outputs.diagnose.vars.explanation }}
 
-      🔧 REMEDIATION METRICS:
-         • Resolution Risk: {{ outputs.classify_error.vars.risk_level }}
-         • Execution Method:{{ outputs.auto_remediate.vars.method ?? outputs.approved_remediate.vars.method ?? 'SKIPPED' }}
+      🧠 FIX SOURCE:        {{ outputs.diagnose.vars.fix_source }}
+         (MEMORY = proven past fix reused | AI = fresh Gemini diagnosis)
+
+      🔧 REMEDIATION:
+         • Risk Level:      {{ outputs.classify_error.vars.risk_level }}
+         • Method:          {{ outputs.auto_remediate.vars.method ?? outputs.approved_remediate.vars.method ?? 'SKIPPED' }}
          • Final Status:    {{ outputs.auto_remediate.vars.status ?? outputs.approved_remediate.vars.status ?? 'SKIPPED' }}
          • Executed Code:   {{ outputs.auto_remediate.vars.executed_code ?? outputs.approved_remediate.vars.executed_code ?? 'None' }}
-         • Error Details:   {{ outputs.auto_remediate.vars.error_message ?? outputs.approved_remediate.vars.error_message ?? 'None' }}
+
+      📊 MEMORY STATS:      {{ outputs.diagnose.vars.memory_stats }}
+
+      🔗 CORRELATION:       {{ outputs.diagnose.vars.correlation_notes }}
       ════════════════════════════════════════════════════════════════
 
   - id: slack_notification
@@ -462,7 +681,7 @@ tasks:
     contentType: application/json
     body: |
       {
-        "text": "🛡️ *Kestra Aegis — Self-Healing Incident Report*\n\n*Pipeline:* `{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}`\n*Error Type:* `{{ trigger.body.error_type ?? inputs.error_type }}`\n*Risk Level:* `{{ outputs.classify_error.vars.risk_level }}`\n*Status:* *{{ outputs.auto_remediate.vars.status ?? outputs.approved_remediate.vars.status ?? 'SKIPPED' }}*\n*Method:* `{{ outputs.auto_remediate.vars.method ?? outputs.approved_remediate.vars.method ?? 'NONE' }}`\n\n*AI Diagnosis:*\n> {{ outputs.diagnose.vars.root_cause }}\n\n*Executed Code:*\n```sql\n{{ outputs.auto_remediate.vars.executed_code ?? outputs.approved_remediate.vars.executed_code ?? 'None' }}\n```"
+        "text": "🛡️ *Kestra Aegis — Self-Healing Report*\n\n*Pipeline:* `{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}`\n*Error:* `{{ trigger.body.error_type ?? inputs.error_type }}`\n*Fix Source:* `{{ outputs.diagnose.vars.fix_source }}`\n*Status:* *{{ outputs.auto_remediate.vars.status ?? outputs.approved_remediate.vars.status ?? 'SKIPPED' }}*\n\n*Root Cause:* {{ outputs.diagnose.vars.root_cause }}\n*Executed:* `{{ outputs.auto_remediate.vars.executed_code ?? outputs.approved_remediate.vars.executed_code ?? 'None' }}`"
       }
     runIf: "{{ globals['slack-webhook-url'] is defined and globals['slack-webhook-url'] != '' }}"
 

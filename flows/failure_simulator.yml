@@ -1,5 +1,8 @@
 id: failure_simulator
 namespace: aegis
+description: |
+  Injects realistic failures into the demo database and triggers the self-healing webhook.
+  Supports 4 failure types: TYPE_MISMATCH, NULL_VIOLATION, SCHEMA_DRIFT, DATA_ANOMALY.
 
 inputs:
   - id: failure_type
@@ -9,6 +12,7 @@ inputs:
       - TYPE_MISMATCH
       - NULL_VIOLATION
       - SCHEMA_DRIFT
+      - DATA_ANOMALY
 
 tasks:
   - id: run_simulation
@@ -22,7 +26,6 @@ tasks:
         - /tmp/kestra-wd:/app/data
     script: |
       import sys
-      import argparse
       import json
       import os
       import duckdb
@@ -56,7 +59,7 @@ tasks:
                   "affected_table": affected_table,
                   "schema_info": schema_info,
                   "sample_data": "Row 16: (16, 'Bad Charlie', 'not_a_number', '2026-06-03')",
-                  "stack_trace": "ConversionException: Conversion Error: Could not convert string 'not_a_number' to DOUBLE"
+                  "stack_trace": "ConversionException: Could not convert string 'not_a_number' to DOUBLE"
               }
 
           elif failure_type == "NULL_VIOLATION":
@@ -69,7 +72,7 @@ tasks:
                   "affected_table": affected_table,
                   "schema_info": schema_info,
                   "sample_data": "Row 2: (2, 'Bob Johnson', NULL, '2026-06-01'), Row 8: (8, 'Hannah Abbott', NULL, '2026-06-03')",
-                  "stack_trace": "AssertionError: Column 'amount' in table 'orders' failed validation rule 'not_null_check'."
+                  "stack_trace": "AssertionError: Column 'amount' failed validation rule 'not_null_check'."
               }
 
           elif failure_type == "SCHEMA_DRIFT":
@@ -82,8 +85,23 @@ tasks:
                   "sample_data": "Header: order_id,customer_name,amount,order_date,discount_code\nRow 1: (1, 'Alice Smith', 120.50, '2026-06-01', 'SAVE10')",
                   "stack_trace": "ValueError: Columns in source data do not match target database schema."
               }
+
+          elif failure_type == "DATA_ANOMALY":
+              # Simulate a sudden massive data loss — delete most rows
+              before_count = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+              con.execute("DELETE FROM orders WHERE order_id > 3")
+              after_count = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
               
-          import json
+              payload = {
+                  "pipeline_name": "aegis_anomaly_simulation",
+                  "error_type": "DATA_ANOMALY",
+                  "error_message": f"Sudden data volume drop detected. Row count went from {before_count} to {after_count} — {((before_count - after_count) / max(before_count, 1)) * 100:.0f}% data loss.",
+                  "affected_table": affected_table,
+                  "schema_info": schema_info,
+                  "sample_data": f"Before: {before_count} rows, After: {after_count} rows. Only rows with order_id <= 3 remain.",
+                  "stack_trace": "DataAnomalyException: Row count dropped below minimum threshold of 10."
+              }
+              
           print(f"::{json.dumps({'outputs': {'payload': payload}})}::", flush=True)
 
       finally:
