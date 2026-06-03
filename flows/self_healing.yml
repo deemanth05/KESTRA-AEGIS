@@ -57,47 +57,99 @@ tasks:
 
       print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
 
-  # ── Step 2: Diagnose (Mock for Phase 2) ──────────
+  # ── Step 2: Diagnose (Real Gemini API) ──────────
   - id: diagnose
     type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install google-genai
     env:
+      GEMINI_API_KEY: "{{ globals['gemini-api-key'] }}"
+      PIPELINE_NAME: "{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}"
       ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
+      ERROR_MESSAGE: "{{ trigger.body.error_message ?? inputs.error_message }}"
+      AFFECTED_TABLE: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
+      SCHEMA_INFO: "{{ trigger.body.schema_info ?? inputs.schema_info }}"
+      SAMPLE_DATA: "{{ trigger.body.sample_data ?? inputs.sample_data }}"
     script: |
       import os
+      import sys
       import json
+      from google import genai
+      from google.genai import types
 
-      error_type = os.getenv("ERROR_TYPE", "UNKNOWN")
+      def main():
+          api_key = os.getenv("GEMINI_API_KEY")
+          if not api_key:
+              print("Error: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
+              sys.exit(1)
 
-      if error_type == "TYPE_MISMATCH":
-          result = {
-              "root_cause": "Column 'amount' contains varchar value 'not_a_number' which violates DECIMAL type constraint.",
-              "fix_type": "SQL",
-              "fix_code": "UPDATE orders SET amount = NULL WHERE order_id = 16;",
-              "explanation": "Set the invalid varchar value to NULL to match the DECIMAL type.",
-              "confidence": 0.95,
-              "risk_assessment": "LOW"
-          }
-      elif error_type == "NULL_VIOLATION":
-          result = {
-              "root_cause": "Column 'amount' contains unexpected NULL values.",
-              "fix_type": "SQL",
-              "fix_code": "UPDATE orders SET amount = 0.00 WHERE amount IS NULL;",
-              "explanation": "Set NULL values in 'amount' column to a default of 0.00.",
-              "confidence": 0.90,
-              "risk_assessment": "LOW"
-          }
-      else:
-          result = {
-              "root_cause": "Source CSV has column 'discount_code' which is missing from target orders table.",
-              "fix_type": "SQL",
-              "fix_code": "ALTER TABLE orders ADD COLUMN discount_code VARCHAR;",
-              "explanation": "Add the missing 'discount_code' column as VARCHAR to support schema drift.",
-              "confidence": 0.98,
-              "risk_assessment": "HIGH"
-          }
+          pipeline_name = os.getenv("PIPELINE_NAME", "unknown")
+          error_type = os.getenv("ERROR_TYPE", "UNKNOWN")
+          error_message = os.getenv("ERROR_MESSAGE", "")
+          affected_table = os.getenv("AFFECTED_TABLE", "unknown")
+          schema_info = os.getenv("SCHEMA_INFO", "")
+          sample_data = os.getenv("SAMPLE_DATA", "")
 
-      print(f"::{json.dumps({'outputs': result})}::", flush=True)
+          prompt = f"""
+      You are Kestra Aegis, an automated self-healing pipeline assistant.
+      Your task is to analyze a failed data pipeline run and generate a fix.
+
+      Failure details:
+      - Pipeline Name: {pipeline_name}
+      - Error Type: {error_type}
+      - Error Message: {error_message}
+      - Affected Table: {affected_table}
+      - Schema Info: {schema_info}
+      - Sample Data: {sample_data}
+
+      Target Database is DuckDB. Use DuckDB-compatible SQL syntax.
+      Never generate DROP, DELETE, or TRUNCATE statements.
+
+      If the fix is a SQL query, set fix_type to 'SQL' and fix_code to the SQL statement.
+      If the fix is a python script, set fix_type to 'PYTHON' and fix_code to the Python script.
+      If the pipeline should be retried later, set fix_type to 'RETRY'.
+      If the error is unknown or cannot be fixed safely, set fix_type to 'SKIP' and risk_assessment to 'HIGH'.
+      """
+
+          try:
+              client = genai.Client(api_key=api_key)
+              response = client.models.generate_content(
+                  model='gemini-2.5-flash',
+                  contents=prompt,
+                  config=types.GenerateContentConfig(
+                      response_mime_type="application/json",
+                      response_schema=types.Schema(
+                          type=types.Type.OBJECT,
+                          properties={
+                              "root_cause": types.Schema(type=types.Type.STRING),
+                              "fix_type": types.Schema(type=types.Type.STRING, enum=["SQL", "PYTHON", "RETRY", "SKIP"]),
+                              "fix_code": types.Schema(type=types.Type.STRING),
+                              "explanation": types.Schema(type=types.Type.STRING),
+                              "confidence": types.Schema(type=types.Type.NUMBER),
+                              "risk_assessment": types.Schema(type=types.Type.STRING, enum=["LOW", "HIGH"])
+                          },
+                          required=["root_cause", "fix_type", "fix_code", "explanation", "confidence", "risk_assessment"]
+                      )
+                  )
+              )
+              
+              result_json = json.loads(response.text)
+          except Exception as e:
+              print(f"Gemini API or Parse Error: {e}", file=sys.stderr)
+              result_json = {
+                  "root_cause": f"Error during Gemini diagnosis: {str(e)}",
+                  "fix_type": "SKIP",
+                  "fix_code": "",
+                  "explanation": "Aegis failed to diagnose the issue using Gemini API.",
+                  "confidence": 0.0,
+                  "risk_assessment": "HIGH"
+              }
+
+          print(f"::{json.dumps({'outputs': result_json})}::", flush=True)
+
+      if __name__ == "__main__":
+          main()
 
   # ── Step 3: Risk Gate routing ─────────────────────
   - id: risk_gate
