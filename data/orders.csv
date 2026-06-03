@@ -1,0 +1,16 @@
+order_id,customer_name,amount,order_date
+1,Alice Smith,120.50,2026-06-01
+2,Bob Johnson,45.00,2026-06-01
+3,Charlie Brown,350.75,2026-06-02
+4,Diana Prince,99.99,2026-06-02
+5,Evan Wright,12.50,2026-06-02
+6,Fiona Gallagher,88.40,2026-06-03
+7,George Costanza,150.00,2026-06-03
+8,Hannah Abbott,62.10,2026-06-03
+9,Ian Malcolm,210.00,2026-06-04
+10,Julia Roberts,75.25,2026-06-04
+11,Kevin Bacon,19.99,2026-06-04
+12,Laura Croft,500.00,2026-06-05
+13,Michael Scott,15.45,2026-06-05
+14,Nora Jones,135.00,2026-06-05
+15,Oscar Martinez,90.80,2026-06-05

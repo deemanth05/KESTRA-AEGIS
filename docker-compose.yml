@@ -40,6 +40,13 @@ services:
             username: kestra
             password: k3str4
         kestra:
+          server:
+            basic-auth:
+              username: admin@kestra.io
+              password: Admin1234!
+              open-urls:
+                - "/api/v1/executions/webhook/"
+                - "/api/v1/main/executions/webhook/"
           repository:
             type: postgres
           storage:

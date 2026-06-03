@@ -1,0 +1,70 @@
+id: setup_database
+namespace: aegis
+
+tasks:
+  - id: init_duckdb
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install duckdb
+    docker:
+      volumes:
+        - /tmp/kestra-wd:/app/data
+    script: |
+      import duckdb
+      import os
+
+      # Ensure data directory exists inside the container
+      os.makedirs("/app/data", exist_ok=True)
+
+      # Connect to the DuckDB file in the mounted directory
+      db_path = "/app/data/pipeline.duckdb"
+      print(f"Connecting to database at {db_path}...")
+      con = duckdb.connect(db_path)
+
+      # Create schema and table
+      con.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+          order_id INTEGER PRIMARY KEY,
+          customer_name VARCHAR,
+          amount DECIMAL(10,2),
+          order_date DATE
+        )
+      """)
+
+      # Truncate to ensure clean run
+      con.execute("TRUNCATE TABLE orders")
+
+      # Inline clean CSV data
+      csv_data = """order_id,customer_name,amount,order_date
+      1,Alice Smith,120.50,2026-06-01
+      2,Bob Johnson,45.00,2026-06-01
+      3,Charlie Brown,350.75,2026-06-02
+      4,Diana Prince,99.99,2026-06-02
+      5,Evan Wright,12.50,2026-06-02
+      6,Fiona Gallagher,88.40,2026-06-03
+      7,George Costanza,150.00,2026-06-03
+      8,Hannah Abbott,62.10,2026-06-03
+      9,Ian Malcolm,210.00,2026-06-04
+      10,Julia Roberts,75.25,2026-06-04
+      11,Kevin Bacon,19.99,2026-06-04
+      12,Laura Croft,500.00,2026-06-05
+      13,Michael Scott,15.45,2026-06-05
+      14,Nora Jones,135.00,2026-06-05
+      15,Oscar Martinez,90.80,2026-06-05"""
+
+      # Clean lines
+      lines = [line.strip() for line in csv_data.strip().split("\n")]
+      rows = []
+      for line in lines[1:]:
+          parts = line.split(",")
+          rows.append((int(parts[0]), parts[1], float(parts[2]), parts[3]))
+
+      # Insert clean data
+      con.executemany("INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?)", rows)
+
+      # Print count to verify
+      res = con.execute("SELECT COUNT(*) FROM orders").fetchone()
+      print(f"Successfully loaded {res[0]} rows into 'orders' table.")
+      
+      con.close()
