@@ -100,16 +100,21 @@ tasks:
       import sys
       import json
       import hashlib
+      import re
       from datetime import datetime
 
       def generate_error_signature(error_type, affected_table, error_message):
-          """Create a stable signature for matching similar errors."""
-          # Normalize: strip numbers, IDs, and timestamps for fuzzy matching
-          normalized_msg = error_message.lower().strip()
-          # Remove specific row IDs and values to match pattern, not instance
-          for char in '0123456789':
-              normalized_msg = normalized_msg.replace(char, '#')
-          raw = f"{error_type}|{affected_table}|{normalized_msg}"
+          """Create a stable signature for matching similar errors.
+          Uses regex normalization to strip variable parts (quoted strings,
+          numbers, UUIDs, timestamps) for robust fuzzy matching."""
+          normalized = error_message.lower().strip()
+          normalized = re.sub(r"'[^']*'", "'?'", normalized)        # quoted strings
+          normalized = re.sub(r'"[^"]*"', '"?"', normalized)         # double-quoted
+          normalized = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'UUID', normalized)
+          normalized = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', 'TIMESTAMP', normalized)
+          normalized = re.sub(r'\b\d+(\.\d+)?\b', '#', normalized)  # numbers
+          normalized = re.sub(r'\s+', ' ', normalized)               # collapse whitespace
+          raw = f"{error_type}|{affected_table}|{normalized}"
           return hashlib.md5(raw.encode()).hexdigest()
 
       def main():
@@ -286,7 +291,7 @@ tasks:
                               type=types.Type.OBJECT,
                               properties={
                                   "root_cause": types.Schema(type=types.Type.STRING),
-                                  "fix_type": types.Schema(type=types.Type.STRING, enum=["SQL", "PYTHON", "RETRY", "SKIP"]),
+                                  "fix_type": types.Schema(type=types.Type.STRING, enum=["SQL", "RETRY", "SKIP"]),
                                   "fix_code": types.Schema(type=types.Type.STRING),
                                   "explanation": types.Schema(type=types.Type.STRING),
                                   "confidence": types.Schema(type=types.Type.NUMBER),
@@ -337,7 +342,7 @@ tasks:
           type: io.kestra.plugin.scripts.python.Script
           containerImage: python:3.11-slim
           beforeCommands:
-            - pip install duckdb
+            - pip install duckdb sqlglot
           taskRunner:
             type: io.kestra.plugin.scripts.runner.docker.Docker
             volumes:
@@ -378,14 +383,26 @@ tasks:
                     print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                     sys.exit(0)
 
-                # Safety Check
-                code_lower = fix_code.lower()
-                for word in ["drop ", "delete ", "truncate "]:
-                    if word in code_lower:
-                        err_msg = f"Safety violation: banned keyword '{word.strip().upper()}'"
-                        outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
-                        print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                        sys.exit(1)
+                # Safety Check — AST-based SQL validation via sqlglot
+                import sqlglot
+                ALLOWED_SQL_TYPES = {"update", "alter", "insert"}
+                try:
+                    parsed = sqlglot.parse(fix_code, dialect="duckdb")
+                    for stmt in parsed:
+                        if stmt is None:
+                            continue
+                        stmt_type = stmt.key.lower()
+                        if stmt_type not in ALLOWED_SQL_TYPES:
+                            err_msg = f"Safety violation: blocked statement type '{stmt_type.upper()}' (only UPDATE/ALTER/INSERT allowed)"
+                            outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
+                            print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                            sys.exit(1)
+                    print(f"✅ SQL safety check passed (statement type: {', '.join(s.key.upper() for s in parsed if s)})")
+                except sqlglot.errors.ParseError as e:
+                    err_msg = f"Safety violation: unparseable SQL blocked — {e}"
+                    outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
+                    print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                    sys.exit(1)
 
                 con = None
                 try:
@@ -442,10 +459,11 @@ tasks:
                             print(f"Warning: Could not update incident log: {e}", file=sys.stderr)
 
                     elif fix_type == "PYTHON":
-                        print(f"Executing Python Fix:\n{fix_code}")
-                        exec(fix_code, {}, {})
-                        print("✅ Python executed successfully.")
-                        outputs = {"status": "FIXED", "method": "AUTO_PYTHON", "executed_code": fix_code}
+                        print("⚠️ Python execution blocked for security. Manual review required.")
+                        print(f"Proposed Python code:\n{fix_code}")
+                        outputs = {"status": "BLOCKED", "method": "PYTHON_BLOCKED",
+                                   "error_message": "Python execution disabled for security. Review fix_code manually.",
+                                   "proposed_code": fix_code}
 
                     else:
                         outputs = {"status": "SKIPPED", "method": fix_type, "error_message": f"Skipped for type: {fix_type}"}
@@ -503,7 +521,7 @@ tasks:
               type: io.kestra.plugin.scripts.python.Script
               containerImage: python:3.11-slim
               beforeCommands:
-                - pip install duckdb
+                - pip install duckdb sqlglot
               taskRunner:
                 type: io.kestra.plugin.scripts.runner.docker.Docker
                 volumes:
@@ -544,14 +562,26 @@ tasks:
                         print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
                         sys.exit(0)
 
-                    # Safety Check
-                    code_lower = fix_code.lower()
-                    for word in ["drop ", "delete ", "truncate "]:
-                        if word in code_lower:
-                            err_msg = f"Safety violation: banned keyword '{word.strip().upper()}'"
-                            outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
-                            print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-                            sys.exit(1)
+                    # Safety Check — AST-based SQL validation via sqlglot
+                    import sqlglot
+                    ALLOWED_SQL_TYPES = {"update", "alter", "insert"}
+                    try:
+                        parsed = sqlglot.parse(fix_code, dialect="duckdb")
+                        for stmt in parsed:
+                            if stmt is None:
+                                continue
+                            stmt_type = stmt.key.lower()
+                            if stmt_type not in ALLOWED_SQL_TYPES:
+                                err_msg = f"Safety violation: blocked statement type '{stmt_type.upper()}' (only UPDATE/ALTER/INSERT allowed)"
+                                outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
+                                print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                                sys.exit(1)
+                        print(f"✅ SQL safety check passed (statement type: {', '.join(s.key.upper() for s in parsed if s)})")
+                    except sqlglot.errors.ParseError as e:
+                        err_msg = f"Safety violation: unparseable SQL blocked — {e}"
+                        outputs = {"status": "FAILED", "method": "SAFETY_CHECK", "error_message": err_msg}
+                        print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                        sys.exit(1)
 
                     con = None
                     try:
@@ -606,10 +636,11 @@ tasks:
                                 print(f"Warning: Could not update incident log: {e}", file=sys.stderr)
 
                         elif fix_type == "PYTHON":
-                            print(f"Executing Python Fix:\n{fix_code}")
-                            exec(fix_code, {}, {})
-                            print("✅ Python executed successfully.")
-                            outputs = {"status": "FIXED", "method": "APPROVED_PYTHON", "executed_code": fix_code}
+                            print("⚠️ Python execution blocked for security. Manual review required.")
+                            print(f"Proposed Python code:\n{fix_code}")
+                            outputs = {"status": "BLOCKED", "method": "PYTHON_BLOCKED",
+                                       "error_message": "Python execution disabled for security. Review fix_code manually.",
+                                       "proposed_code": fix_code}
 
                         else:
                             outputs = {"status": "SKIPPED", "method": fix_type, "error_message": f"Skipped for type: {fix_type}"}

@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import duckdb
+import sqlglot
 
 def main():
     fix_type = os.getenv("FIX_TYPE", "SKIP").upper()
@@ -18,20 +19,35 @@ def main():
         print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
         sys.exit(0)
 
-    # ── Safety Check ────────────────────────────────
-    code_lower = fix_code.lower()
-    banned_keywords = ["drop ", "delete ", "truncate "]
-    for word in banned_keywords:
-        if word in code_lower:
-            err_msg = f"Safety violation: code contains banned keyword '{word.strip().upper()}'"
-            print(err_msg, file=sys.stderr)
-            outputs = {
-                "status": "FAILED",
-                "method": "SAFETY_CHECK",
-                "error_message": err_msg
-            }
-            print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
-            sys.exit(1)
+    # ── Safety Check — AST-based SQL validation via sqlglot ──
+    ALLOWED_SQL_TYPES = {"update", "alter", "insert"}
+    try:
+        parsed = sqlglot.parse(fix_code, dialect="duckdb")
+        for stmt in parsed:
+            if stmt is None:
+                continue
+            stmt_type = stmt.key.lower()
+            if stmt_type not in ALLOWED_SQL_TYPES:
+                err_msg = f"Safety violation: blocked statement type '{stmt_type.upper()}' (only UPDATE/ALTER/INSERT allowed)"
+                print(err_msg, file=sys.stderr)
+                outputs = {
+                    "status": "FAILED",
+                    "method": "SAFETY_CHECK",
+                    "error_message": err_msg
+                }
+                print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+                sys.exit(1)
+        print(f"✅ SQL safety check passed (statement type: {', '.join(s.key.upper() for s in parsed if s)})")
+    except sqlglot.errors.ParseError as e:
+        err_msg = f"Safety violation: unparseable SQL blocked — {e}"
+        print(err_msg, file=sys.stderr)
+        outputs = {
+            "status": "FAILED",
+            "method": "SAFETY_CHECK",
+            "error_message": err_msg
+        }
+        print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
+        sys.exit(1)
 
     # ── Execution ──────────────────────────────────
     if fix_type == "SQL":
@@ -69,24 +85,14 @@ def main():
             con.close()
 
     elif fix_type == "PYTHON":
-        print(f"Executing Python Fix:\n{fix_code}")
-        try:
-            local_vars = {}
-            exec(fix_code, globals(), local_vars)
-            print("Python code executed successfully.")
-            outputs = {
-                "status": "FIXED",
-                "method": "AUTO_PYTHON",
-                "executed_code": fix_code
-            }
-        except Exception as e:
-            err_msg = f"Python error: {str(e)}"
-            print(err_msg, file=sys.stderr)
-            outputs = {
-                "status": "FAILED",
-                "method": "AUTO_PYTHON",
-                "error_message": err_msg
-            }
+        print("⚠️ Python execution blocked for security. Manual review required.")
+        print(f"Proposed Python code:\n{fix_code}")
+        outputs = {
+            "status": "BLOCKED",
+            "method": "PYTHON_BLOCKED",
+            "error_message": "Python execution disabled for security. Review fix_code manually.",
+            "proposed_code": fix_code
+        }
 
     else:
         # For SKIP or RETRY
