@@ -129,40 +129,46 @@ Upload all `.yml` files from `flows/` into Kestra's Flow editor.
 
 ## 💻 Demo Scenarios
 
-### Step A: Initialize Database
+### 🎬 One-Click Full Demo
+Execute `demo_runner` → runs the entire demo sequence automatically:
+1. Initializes database → 2. TYPE_MISMATCH (AI fix) → 3. TYPE_MISMATCH (MEMORY hit!) → 4. NULL_VIOLATION → 5. CUSTOMER_DATA_CORRUPTION → 6. Health Dashboard
+
+### Manual Step-by-Step
+
+#### Step A: Initialize Database
 Execute `setup_database` → creates `orders` (15 rows) + `customers` (10 rows) + system tables.
 
-### Step B: Run Scenarios
+#### Step B: Run Scenarios
 
-#### Scenario 1: `TYPE_MISMATCH` (LOW Risk — Auto-Heals)
+##### Scenario 1: `TYPE_MISMATCH` (LOW Risk — Auto-Heals)
 - Injects a string into a DECIMAL column
 - Aegis diagnoses via Gemini → auto-executes SQL fix → verifies fix worked
 - **Run it twice** → second run uses MEMORY (no Gemini call!)
 
-#### Scenario 2: `NULL_VIOLATION` (LOW Risk — Auto-Heals)
+##### Scenario 2: `NULL_VIOLATION` (LOW Risk — Auto-Heals)
 - Sets NULL in required column
 - Aegis generates cleanup query → auto-executes → verifies NULLs removed
 
-#### Scenario 3: `SCHEMA_DRIFT` (HIGH Risk — Human Approval)
+##### Scenario 3: `SCHEMA_DRIFT` (HIGH Risk — Human Approval)
 - Source has extra column not in target schema
 - Aegis proposes ALTER TABLE → **pauses for human approval**
 - Review in Kestra UI → Approve → fix executes
 
-#### Scenario 4: `DATA_ANOMALY` (HIGH Risk — Proactive Detection)
+##### Scenario 4: `DATA_ANOMALY` (HIGH Risk — Proactive Detection)
 - Mass-deletes rows simulating data loss
 - Also run `anomaly_monitor` separately to see proactive detection
 
-#### Scenario 5: `CUSTOMER_DATA_CORRUPTION` (Multi-Table)
+##### Scenario 5: `CUSTOMER_DATA_CORRUPTION` (Multi-Table)
 - Corrupts email data in the `customers` table
 - Demonstrates cross-table incident correlation with orders failures
 
-### Step C: Verify Memory Learning
+#### Step C: Verify Memory Learning
 Run `TYPE_MISMATCH` twice:
 1. First run → diagnose shows `fix_source: AI` (Gemini called)
 2. Second run → diagnose shows `fix_source: MEMORY` (instant, no AI call)
 
-### Step D: View Dashboard
-Execute `health_dashboard` → see MTTR, success rate, memory efficiency, and incident timeline.
+#### Step D: View Dashboard
+Execute `health_dashboard` → see MTTR, success rate, memory efficiency, KV Store metrics, and incident timeline.
 
 ---
 
@@ -192,13 +198,14 @@ Kestra Aegis uses **defense-in-depth** to prevent AI-generated fixes from causin
 
 ---
 
-## 🏆 Kestra Features Used
+## 🏆 Kestra Features Used (21+)
 
 | Feature | Usage |
 |---------|-------|
 | **Subflows** | Shared remediation logic — called from both auto and approved paths |
 | **Webhook Triggers** | Receives pipeline failure telemetry via HTTP POST |
 | **Schedule Triggers** | Anomaly monitor runs every 15 minutes |
+| **Flow Triggers** | Anomaly monitor auto-runs after database setup completes |
 | **Labels** | Dynamic severity, pipeline, fix_source labels on every execution |
 | **ForEach (EachSequential)** | Iterates over all monitored tables in anomaly detection |
 | **Concurrency Controls** | Limits self-healing to 1 concurrent execution |
@@ -212,7 +219,11 @@ Kestra Aegis uses **defense-in-depth** to prevent AI-generated fixes from causin
 | **Globals / Secrets** | API key and Slack webhook management |
 | **HTTP Request** | Slack notifications + webhook triggering |
 | **runIf Conditional** | Conditional Slack notification |
-| **Multiple Flows** | 6 flows: self_healing, remediate_pipeline, failure_simulator, setup_database, anomaly_monitor, health_dashboard |
+| **pluginDefaults** | DRY configuration — shared Docker runner + volume config across all flows |
+| **KV Store (Set/Get)** | Cross-execution state tracking — total heals, system status, last incident |
+| **Custom Metrics** | Emits MTTR, fix success rate, memory cache hits to Kestra Metrics UI |
+| **Task Descriptions** | Markdown documentation on every task — renders in Kestra UI |
+| **Multiple Flows** | 8 flows: self_healing, remediate_pipeline, failure_simulator, setup_database, anomaly_monitor, health_dashboard, demo_runner |
 
 ---
 

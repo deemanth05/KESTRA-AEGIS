@@ -27,15 +27,15 @@ def upload_flow(filepath):
         yaml_content = f.read()
         
     # Try PUT first to update existing flow
-    put_url = f"http://localhost:8080/api/v1/flows/{namespace}/{flow_id}"
-    response = requests.put(put_url, auth=auth, headers=headers, data=yaml_content)
+    put_url = f"http://127.0.0.1:8080/api/v1/flows/{namespace}/{flow_id}"
+    response = requests.put(put_url, auth=auth, headers=headers, data=yaml_content, timeout=60)
     
     if response.status_code in [200, 201]:
         print(f"[SUCCESS] Updated existing flow {namespace}.{flow_id}")
     elif response.status_code == 404:
         # Fallback to POST if PUT returns 404 Not Found
-        post_url = "http://localhost:8080/api/v1/flows"
-        response = requests.post(post_url, auth=auth, headers=headers, data=yaml_content)
+        post_url = "http://127.0.0.1:8080/api/v1/flows"
+        response = requests.post(post_url, auth=auth, headers=headers, data=yaml_content, timeout=60)
         if response.status_code in [200, 201]:
             print(f"[SUCCESS] Created new flow {namespace}.{flow_id}")
         else:

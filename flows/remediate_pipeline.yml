@@ -48,13 +48,11 @@ tasks:
   # ══════════════════════════════════════════════════════════
   - id: execute_fix
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
+    description: |
+      **Safe SQL Executor** — Validates fixes via sqlglot AST parsing (blocks DROP/DELETE/TRUNCATE), 
+      executes approved SQL, verifies results, and stores successful fixes in memory.
     beforeCommands:
       - pip install duckdb==1.3.0 sqlglot==26.30.0
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-      volumes:
-        - /tmp/kestra-wd:/app/data
     retry:
       type: exponential
       maxAttempt: 3
@@ -82,7 +80,7 @@ tasks:
       def main():
           fix_type = os.getenv("FIX_TYPE", "SKIP").upper()
           fix_code = os.getenv("FIX_CODE", "").strip()
-          db_path = "/app/data/pipeline.duckdb"
+          db_path = "/tmp/kestra-wd/pipeline.duckdb"
           error_signature = os.getenv("ERROR_SIGNATURE", "")
           incident_id = os.getenv("INCIDENT_ID", "0")
           fix_source = os.getenv("FIX_SOURCE", "AI")
@@ -273,6 +271,13 @@ tasks:
           finally:
               if con:
                   con.close()
+
+          # Emit Kestra metrics
+          fix_metrics = [
+              {"name": "aegis.fix.success", "type": "counter", "value": 1 if outputs.get('status') == 'FIXED' else 0},
+              {"name": "aegis.fix.rows_affected", "type": "counter", "value": int(outputs.get('rows_affected', 0))}
+          ]
+          print(f"::{json.dumps({'metrics': fix_metrics})}::", flush=True)
 
           print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
           if outputs.get("status") == "FAILED":

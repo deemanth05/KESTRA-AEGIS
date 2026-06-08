@@ -14,13 +14,23 @@ description: |
 
 labels:
   severity: "{{ outputs.classify_error.vars.risk_level }}"
-  pipeline: "{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}"
+  pipeline: "{{ vars.pipeline_name }}"
   fix_source: "{{ outputs.diagnose.vars.fix_source }}"
-  error_type: "{{ trigger.body.error_type ?? inputs.error_type }}"
+  error_type: "{{ vars.error_type }}"
 
 concurrency:
   limit: 1
   behavior: QUEUE
+
+variables:
+  pipeline_name: "{{ (trigger is defined and trigger.containsKey('flowId')) ? trigger.flowId : ((trigger is defined and trigger.containsKey('body')) ? trigger.body.pipeline_name : inputs.pipeline_name) }}"
+  error_type: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.error_type : inputs.error_type }}"
+  error_message: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.error_message : inputs.error_message }}"
+  affected_table: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.affected_table : inputs.affected_table }}"
+  schema_info: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.schema_info : inputs.schema_info }}"
+  sample_data: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.sample_data : inputs.sample_data }}"
+  stack_trace: "{{ (trigger is defined and trigger.containsKey('body')) ? trigger.body.stack_trace : inputs.stack_trace }}"
+  failed_execution_id: "{{ (trigger is defined and trigger.containsKey('executionId')) ? trigger.executionId : '' }}"
 
 inputs:
   - id: pipeline_name
@@ -45,14 +55,102 @@ inputs:
 
 tasks:
   # ══════════════════════════════════════════════════════════
+  # STEP 0: Fetch Failed Execution Context (if run as listener)
+  # ══════════════════════════════════════════════════════════
+  - id: fetch_failed_execution_context
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      **Failed Context Extractor** — Queries Kestra API to retrieve the logs and inputs of the failed execution.
+    runIf: "{{ trigger is defined and trigger.containsKey('executionId') }}"
+    beforeCommands:
+      - pip install requests==2.32.3
+    env:
+      FAILED_EXECUTION_ID: "{{ vars.failed_execution_id }}"
+    script: |
+      import os, sys, json, requests
+      
+      failed_exec_id = os.getenv("FAILED_EXECUTION_ID")
+      auth = ("admin@kestra.io", "Admin1234!")
+      
+      url = f"http://localhost:8080/api/v1/executions/{failed_exec_id}"
+      try:
+          resp = requests.get(url, auth=auth, timeout=10)
+          if resp.status_code != 200:
+              print(f"Error fetching execution: {resp.text}", file=sys.stderr)
+              sys.exit(0)
+          
+          exec_data = resp.json()
+          pipeline_name = exec_data.get("flowId", "unknown_flow")
+          
+          failed_task_run = None
+          for tr in exec_data.get("taskRunList", []):
+              if tr.get("state", {}).get("current") == "FAILED":
+                  failed_task_run = tr
+                  break
+          
+          error_message = "Execution failed."
+          error_type = "UNKNOWN"
+          affected_table = "unknown"
+          schema_info = ""
+          sample_data = ""
+          stack_trace = ""
+          
+          if failed_task_run:
+              outputs = failed_task_run.get("outputs") or {}
+              error_message = outputs.get("error_message") or f"Task '{failed_task_run.get('taskId')}' failed."
+              error_type = outputs.get("error_type") or "UNKNOWN"
+              affected_table = outputs.get("affected_table") or "unknown"
+              schema_info = outputs.get("schema_info") or ""
+              sample_data = outputs.get("sample_data") or ""
+              
+          log_url = f"http://localhost:8080/api/v1/logs/{failed_exec_id}"
+          log_resp = requests.get(log_url, auth=auth, timeout=10)
+          if log_resp.status_code == 200:
+              logs = log_resp.json()
+              err_logs = [l.get("message", "") for l in logs if l.get("level") in ("ERROR", "WARN")]
+              if err_logs:
+                  stack_trace = "\n".join(err_logs[:10])
+                  if error_message == "Execution failed." or "failed" in error_message.lower():
+                      for log_msg in err_logs:
+                          if "Exception" in log_msg or "Error" in log_msg:
+                              error_message = log_msg
+                              break
+          
+          if error_type == "UNKNOWN":
+              if "conversion" in error_message.lower() or "type" in error_message.lower():
+                  error_type = "TYPE_MISMATCH"
+              elif "null" in error_message.lower():
+                  error_type = "NULL_VIOLATION"
+              elif "schema" in error_message.lower() or "column" in error_message.lower():
+                  error_type = "SCHEMA_DRIFT"
+              elif "anomaly" in error_message.lower() or "volume" in error_message.lower():
+                  error_type = "DATA_ANOMALY"
+          
+          outs = {
+              "pipeline_name": pipeline_name,
+              "error_type": error_type,
+              "error_message": error_message,
+              "affected_table": affected_table,
+              "schema_info": schema_info,
+              "sample_data": sample_data,
+              "stack_trace": stack_trace[:1000]
+          }
+          print(f"::{json.dumps({'outputs': outs})}::", flush=True)
+          
+      except Exception as e:
+          print(f"Error querying failed execution: {e}", file=sys.stderr)
+          sys.exit(0)
+
+  # ══════════════════════════════════════════════════════════
   # STEP 1: Classify Error Risk Level
   # ══════════════════════════════════════════════════════════
   - id: classify_error
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
+    description: |
+      **Risk Classification Engine** — Categorizes pipeline failures as LOW or HIGH risk based on error type patterns.
     env:
-      ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
-      ERROR_MESSAGE: "{{ trigger.body.error_message ?? inputs.error_message }}"
+      ERROR_TYPE: "{{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}"
+      ERROR_MESSAGE: "{{ outputs.fetch_failed_execution_context.outputs.error_message ?? vars.error_message }}"
     script: |
       import json
       import os
@@ -89,22 +187,19 @@ tasks:
   # ══════════════════════════════════════════════════════════
   - id: diagnose
     type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
+    description: |
+      **AI Diagnosis with Memory** — Checks fix_history for proven solutions before calling Gemini. Logs incidents for cross-pipeline correlation.
     beforeCommands:
       - pip install google-genai==1.14.0 duckdb==1.3.0
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-      volumes:
-        - /tmp/kestra-wd:/app/data
     env:
       GEMINI_API_KEY: "{{ globals['gemini-api-key'] }}"
-      PIPELINE_NAME: "{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}"
-      ERROR_TYPE: "{{ trigger.body.error_type ?? inputs.error_type }}"
-      ERROR_MESSAGE: "{{ trigger.body.error_message ?? inputs.error_message }}"
-      AFFECTED_TABLE: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
-      SCHEMA_INFO: "{{ trigger.body.schema_info ?? inputs.schema_info }}"
-      SAMPLE_DATA: "{{ trigger.body.sample_data ?? inputs.sample_data }}"
-      STACK_TRACE: "{{ trigger.body.stack_trace ?? inputs.stack_trace }}"
+      PIPELINE_NAME: "{{ outputs.fetch_failed_execution_context.outputs.pipeline_name ?? vars.pipeline_name }}"
+      ERROR_TYPE: "{{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}"
+      ERROR_MESSAGE: "{{ outputs.fetch_failed_execution_context.outputs.error_message ?? vars.error_message }}"
+      AFFECTED_TABLE: "{{ outputs.fetch_failed_execution_context.outputs.affected_table ?? vars.affected_table }}"
+      SCHEMA_INFO: "{{ outputs.fetch_failed_execution_context.outputs.schema_info ?? vars.schema_info }}"
+      SAMPLE_DATA: "{{ outputs.fetch_failed_execution_context.outputs.sample_data ?? vars.sample_data }}"
+      STACK_TRACE: "{{ outputs.fetch_failed_execution_context.outputs.stack_trace ?? vars.stack_trace }}"
     script: |
       import os
       import sys
@@ -137,7 +232,7 @@ tasks:
           sample_data = os.getenv("SAMPLE_DATA", "")
           stack_trace = os.getenv("STACK_TRACE", "")
 
-          db_path = "/app/data/pipeline.duckdb"
+          db_path = "/tmp/kestra-wd/pipeline.duckdb"
           fix_source = "AI"
           correlation_notes = ""
           memory_stats = {"total_fixes_stored": 0, "cache_hit_rate": "N/A"}
@@ -330,6 +425,14 @@ tasks:
               "memory_stats": json.dumps(memory_stats),
               "correlation_notes": correlation_notes[:500] if correlation_notes else ""
           }
+
+          # Emit Kestra metrics
+          metrics = [
+              {"name": "aegis.memory.cache_hit", "type": "counter", "value": 1 if fix_source == "MEMORY" else 0},
+              {"name": "aegis.memory.ai_call", "type": "counter", "value": 1 if fix_source == "AI" else 0}
+          ]
+          print(f"::{json.dumps({'metrics': metrics})}::", flush=True)
+
           print(f"::{json.dumps({'outputs': outputs})}::", flush=True)
 
           if con:
@@ -343,7 +446,9 @@ tasks:
   # ══════════════════════════════════════════════════════════
   - id: risk_gate
     type: io.kestra.plugin.core.flow.Switch
-    value: "{{ (outputs.diagnose.vars.confidence | float) < 0.5 ? 'HIGH' : outputs.classify_error.vars.risk_level }}"
+    description: |
+      **Intelligent Router** — Routes to auto-remediation (LOW risk + high confidence) or human approval gate (HIGH risk or low confidence).
+    value: "{{ outputs.diagnose.vars.confidence < 0.5 ? 'HIGH' : outputs.classify_error.vars.risk_level }}"
     cases:
       LOW:
         - id: auto_remediate
@@ -360,8 +465,8 @@ tasks:
             explanation: "{{ outputs.diagnose.vars.explanation }}"
             confidence: "{{ outputs.diagnose.vars.confidence }}"
             risk_assessment: "{{ outputs.diagnose.vars.risk_assessment }}"
-            error_type: "{{ trigger.body.error_type ?? inputs.error_type }}"
-            affected_table: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
+            error_type: "{{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}"
+            affected_table: "{{ outputs.fetch_failed_execution_context.outputs.affected_table ?? vars.affected_table }}"
             method_label: AUTO_SQL
           wait: true
           transmitFailed: true
@@ -408,8 +513,8 @@ tasks:
                 explanation: "{{ outputs.diagnose.vars.explanation }}"
                 confidence: "{{ outputs.diagnose.vars.confidence }}"
                 risk_assessment: "{{ outputs.diagnose.vars.risk_assessment }}"
-                error_type: "{{ trigger.body.error_type ?? inputs.error_type }}"
-                affected_table: "{{ trigger.body.affected_table ?? inputs.affected_table }}"
+                error_type: "{{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}"
+                affected_table: "{{ outputs.fetch_failed_execution_context.outputs.affected_table ?? vars.affected_table }}"
                 method_label: APPROVED_SQL
               wait: true
               transmitFailed: true
@@ -418,7 +523,7 @@ tasks:
               type: io.kestra.plugin.core.log.Log
               message: |
                 🚨 ESCALATION: Fix rejected by reviewer.
-                Pipeline: {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
+                Pipeline: {{ outputs.fetch_failed_execution_context.outputs.pipeline_name ?? vars.pipeline_name }}
                 Reviewer notes: {{ outputs.human_approval.onResume.reviewer_notes }}
 
   # ══════════════════════════════════════════════════════════
@@ -426,14 +531,16 @@ tasks:
   # ══════════════════════════════════════════════════════════
   - id: post_mortem
     type: io.kestra.plugin.core.log.Log
+    description: |
+      **Incident Post-Mortem** — Generates structured report with fix source, memory stats, and correlation data.
     message: |
       ════════════════════════════════════════════════════════════════
       📋 KESTRA AEGIS — INCIDENT POST-MORTEM
       ════════════════════════════════════════════════════════════════
       🔴 PIPELINE FAILURE:
-         • Pipeline:        {{ trigger.body.pipeline_name ?? inputs.pipeline_name }}
-         • Error Type:      {{ trigger.body.error_type ?? inputs.error_type }}
-         • Affected Table:  {{ trigger.body.affected_table ?? inputs.affected_table }}
+         • Pipeline:        {{ outputs.fetch_failed_execution_context.outputs.pipeline_name ?? vars.pipeline_name }}
+         • Error Type:      {{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}
+         • Affected Table:  {{ outputs.fetch_failed_execution_context.outputs.affected_table ?? vars.affected_table }}
 
       🤖 AI DIAGNOSIS:
          • Root Cause:      {{ outputs.diagnose.vars.root_cause }}
@@ -454,6 +561,24 @@ tasks:
       🔗 CORRELATION:       {{ outputs.diagnose.vars.correlation_notes }}
       ════════════════════════════════════════════════════════════════
 
+  - id: update_heal_counter
+    type: io.kestra.plugin.core.kv.Set
+    description: |
+      **KV Metrics Update** — Increments the total heals counter in Kestra's KV Store for cross-execution tracking.
+    key: aegis_total_heals
+    kvType: NUMBER
+    value: "{{ (kv('aegis_total_heals') ?? 0) + 1 }}"
+
+  - id: update_last_incident
+    type: io.kestra.plugin.core.kv.Set
+    key: aegis_last_incident_time
+    value: "{{ now() }}"
+
+  - id: update_system_status
+    type: io.kestra.plugin.core.kv.Set
+    key: aegis_system_status
+    value: "{{ outputs.auto_remediate.outputs.status ?? outputs.approved_remediate.outputs.status ?? 'MONITORING' }}"
+
   - id: slack_notification
     type: io.kestra.plugin.core.http.Request
     uri: "{{ globals['slack-webhook-url'] }}"
@@ -461,9 +586,36 @@ tasks:
     contentType: application/json
     body: |
       {
-        "text": "🛡️ *Kestra Aegis — Self-Healing Report*\n\n*Pipeline:* `{{ trigger.body.pipeline_name ?? inputs.pipeline_name }}`\n*Error:* `{{ trigger.body.error_type ?? inputs.error_type }}`\n*Fix Source:* `{{ outputs.diagnose.vars.fix_source }}`\n*Status:* *{{ outputs.auto_remediate.outputs.status ?? outputs.approved_remediate.outputs.status ?? 'SKIPPED' }}*\n\n*Root Cause:* {{ outputs.diagnose.vars.root_cause }}\n*Executed:* `{{ outputs.auto_remediate.outputs.executed_code ?? outputs.approved_remediate.outputs.executed_code ?? 'None' }}`"
+        "text": "🛡️ *Kestra Aegis — Self-Healing Report*\n\n*Pipeline:* `{{ outputs.fetch_failed_execution_context.outputs.pipeline_name ?? vars.pipeline_name }}`\n*Error:* `{{ outputs.fetch_failed_execution_context.outputs.error_type ?? vars.error_type }}`\n*Fix Source:* `{{ outputs.diagnose.vars.fix_source }}`\n*Status:* *{{ outputs.auto_remediate.outputs.status ?? outputs.approved_remediate.outputs.status ?? 'SKIPPED' }}*\n\n*Root Cause:* {{ outputs.diagnose.vars.root_cause }}\n*Executed:* `{{ outputs.auto_remediate.outputs.executed_code ?? outputs.approved_remediate.outputs.executed_code ?? 'None' }}`"
       }
     runIf: "{{ globals['slack-webhook-url'] is defined and globals['slack-webhook-url'] != '' }}"
+
+  - id: auto_replay_execution
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      **Auto Replay Executor** — Automatically restarts the failed pipeline execution after successful healing.
+    runIf: "{{ trigger is defined and trigger.containsKey('executionId') and (outputs.auto_remediate.outputs.status == 'FIXED' or outputs.approved_remediate.outputs.status == 'FIXED') }}"
+    beforeCommands:
+      - pip install requests==2.32.3
+    env:
+      FAILED_EXECUTION_ID: "{{ vars.failed_execution_id }}"
+    script: |
+      import os, sys, requests
+      
+      failed_exec_id = os.getenv("FAILED_EXECUTION_ID")
+      auth = ("admin@kestra.io", "Admin1234!")
+      
+      url = f"http://localhost:8080/api/v1/executions/{failed_exec_id}/replay"
+      print(f"🔄 Requesting auto-replay for execution {failed_exec_id}...")
+      try:
+          resp = requests.post(url, auth=auth, timeout=10)
+          print(f"Replay response status: {resp.status_code}")
+          if resp.status_code in (200, 201):
+              print("✅ Execution successfully replayed! Pipeline has resumed.")
+          else:
+              print(f"❌ Failed to replay execution: {resp.text}")
+      except Exception as e:
+          print(f"Error during auto-replay: {e}", file=sys.stderr)
 
 outputs:
   - id: incident_id
@@ -480,6 +632,18 @@ triggers:
   - id: webhook
     type: io.kestra.plugin.core.trigger.Webhook
     key: aegis-webhook-secret
+
+  - id: flow_listener
+    type: io.kestra.plugin.core.trigger.Flow
+    description: "Listen to any pipeline failures in the namespace"
+    conditions:
+      - type: io.kestra.plugin.core.condition.ExecutionStatus
+        in:
+          - FAILED
+      - type: io.kestra.plugin.core.condition.ExecutionNamespace
+        namespace: aegis
+      - type: io.kestra.plugin.core.condition.Expression
+        expression: "{{ trigger.flowId != 'self_healing' and trigger.flowId != 'remediate_pipeline' and trigger.flowId != 'demo_runner' }}"
 
 errors:
   - id: global_error_handler

@@ -26,12 +26,13 @@ services:
     pull_policy: always
     stop_grace_period: 6m
     user: "root"
-    command: server standalone
+    command: server standalone --worker-thread 2
     volumes:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/kestra-wd:/tmp/kestra-wd
     environment:
+      JAVA_OPTS: "-Xmx4096m -XX:-DoEscapeAnalysis"
       KESTRA_CONFIGURATION: |
         datasources:
           postgres:
@@ -40,11 +41,16 @@ services:
             username: kestra
             password: k3str4
         kestra:
+          tutorialFlows:
+            enabled: false
+          worker:
+            threads: 2
           plugins:
-            configurations:
-              - type: io.kestra.plugin.scripts.runner.docker.Docker
+            defaults:
+              - type: io.kestra.plugin.scripts.python.Script
                 values:
-                  volume-enabled: true
+                  taskRunner:
+                    type: io.kestra.plugin.core.runner.Process
           server:
             basic-auth:
               username: admin@kestra.io
@@ -52,6 +58,11 @@ services:
               open-urls:
                 - "/api/v1/executions/webhook/"
                 - "/api/v1/main/executions/webhook/"
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+            runners:
+              default: io.kestra.plugin.core.runner.Process
           repository:
             type: postgres
           storage:
@@ -60,9 +71,6 @@ services:
               base-path: "/app/storage"
           queue:
             type: postgres
-          tasks:
-            tmp-dir:
-              path: /tmp/kestra-wd/tmp
           url: http://localhost:8080/
           variables:
             globals:
