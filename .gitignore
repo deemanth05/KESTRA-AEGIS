@@ -30,4 +30,5 @@ desktop.ini
 # Planning files and specification docs (Internal development references)
 MASTER_PLAN.md
 PROGRESS.md
-docs/
+docs/*
+!docs/*.png
