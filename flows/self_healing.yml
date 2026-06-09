@@ -574,7 +574,7 @@ tasks:
       **KV Metrics Update** — Increments the total heals counter in Kestra's KV Store for cross-execution tracking.
     key: aegis_total_heals
     kvType: NUMBER
-    value: "{{ (outputs.read_heal_counter.value ?? 0) | int + 1 }}"
+    value: "{{ (outputs.read_heal_counter.value ?? 0) + 1 }}"
 
 
   - id: update_last_incident
