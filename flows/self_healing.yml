@@ -561,13 +561,21 @@ tasks:
       🔗 CORRELATION:       {{ outputs.diagnose.vars.correlation_notes }}
       ════════════════════════════════════════════════════════════════
 
+  - id: read_heal_counter
+    type: io.kestra.plugin.core.kv.Get
+    description: |
+      **KV Metrics Read** — Reads the current total heals counter.
+    key: aegis_total_heals
+    errorOnMissing: false
+
   - id: update_heal_counter
     type: io.kestra.plugin.core.kv.Set
     description: |
       **KV Metrics Update** — Increments the total heals counter in Kestra's KV Store for cross-execution tracking.
     key: aegis_total_heals
     kvType: NUMBER
-    value: "{{ (kv('aegis_total_heals') ?? 0) + 1 }}"
+    value: "{{ (outputs.read_heal_counter.value ?? 0) | int + 1 }}"
+
 
   - id: update_last_incident
     type: io.kestra.plugin.core.kv.Set
